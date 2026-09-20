@@ -32,6 +32,12 @@ pub enum HerdrError {
     CliFailed { status: i32, stderr: String },
     #[error("no CLI mapping for herdr method {0}")]
     UnsupportedMethod(String),
+    #[error("herdr unavailable at {path}: {socket}; CLI fallback: {cli}")]
+    Unavailable {
+        path: PathBuf,
+        socket: String,
+        cli: String,
+    },
 }
 
 impl HerdrError {

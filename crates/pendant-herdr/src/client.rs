@@ -131,9 +131,19 @@ impl HerdrClient {
     pub async fn rpc(&self, method: &str, params: Value) -> Result<Value, HerdrError> {
         match self.rpc_socket(method, params.clone()).await {
             Ok(value) => Ok(value),
-            Err(err) if err.is_transport() => {
-                tracing::debug!(error = %err, method, "herdr socket unavailable; trying CLI");
-                cli::rpc_cli(&self.socket_path, method, params).await
+            Err(sock_err) if sock_err.is_transport() => {
+                tracing::debug!(error = %sock_err, method, "herdr socket unavailable; trying CLI");
+                match cli::rpc_cli(&self.socket_path, method, params).await {
+                    Ok(value) => Ok(value),
+                    Err(HerdrError::UnsupportedMethod(method)) => {
+                        Err(HerdrError::UnsupportedMethod(method))
+                    }
+                    Err(cli_err) => Err(HerdrError::Unavailable {
+                        path: self.socket_path.clone(),
+                        socket: sock_err.to_string(),
+                        cli: cli_err.to_string(),
+                    }),
+                }
             }
             Err(err) => Err(err),
         }
@@ -233,5 +243,12 @@ mod tests {
         let client = HerdrClient::new("/tmp/pendant-definitely-missing.sock");
         let err = client.rpc_socket("ping", json!({})).await.unwrap_err();
         assert!(err.is_transport());
+    }
+
+    #[tokio::test]
+    async fn missing_socket_and_cli_is_unavailable() {
+        let client = HerdrClient::new("/tmp/pendant-definitely-missing.sock");
+        let err = client.rpc("ping", json!({})).await.unwrap_err();
+        assert!(matches!(err, HerdrError::Unavailable { .. }));
     }
 }

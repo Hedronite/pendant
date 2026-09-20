@@ -201,7 +201,8 @@ fn herdr_error(err: HerdrError) -> Response {
         HerdrError::Connect { .. }
         | HerdrError::CliMissing
         | HerdrError::Timeout
-        | HerdrError::EmptyResponse => (StatusCode::BAD_GATEWAY, "herdr_unavailable"),
+        | HerdrError::EmptyResponse
+        | HerdrError::Unavailable { .. } => (StatusCode::BAD_GATEWAY, "herdr_unavailable"),
         HerdrError::Rpc { code, .. } if code == "agent_blocked" => {
             (StatusCode::CONFLICT, "agent_blocked")
         }
