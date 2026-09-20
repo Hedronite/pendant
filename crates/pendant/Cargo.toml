@@ -1,0 +1,19 @@
+[package]
+name = "pendant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pendant — loopback bridge + PWA for a local herdr server"
+
+[[bin]]
+name = "pendant"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+pendant-bridge = { path = "../pendant-bridge" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
