@@ -1,0 +1,12 @@
+[package]
+name = "pendant-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Embedded Pendant PWA assets"
+
+[dependencies]
+rust-embed.workspace = true

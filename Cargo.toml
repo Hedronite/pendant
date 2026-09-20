@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pendant",
+    "crates/pendant-bridge",
+    "crates/pendant-herdr",
+    "crates/pendant-web",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/VirtualMachinist/pendant"
+description = "Phone thin client for a local herdr server"
+# crates.io `pendant` 0.0.1 is the name reserve. Do not publish from this
+# scaffold. Bump past 0.0.1 and clear publish=false when real code ships.
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json"] }
+futures-util = "0.3"
+mime_guess = "2"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "time",
+] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
