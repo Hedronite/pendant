@@ -46,6 +46,8 @@ Flags vary by `tailscale` version; this is a placeholder. Open the Serve HTTPS U
 | `pendant-herdr` | herdr Unix-socket client (CLI JSON fallback) |
 | `pendant-web` | Static PWA assets |
 
+This tree is version `0.0.1` to match the crates.io name reserve. Packages are `publish = false`. Bump past `0.0.1` when a real crate ships.
+
 ## License
 
 MIT

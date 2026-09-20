@@ -8,12 +8,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/VirtualMachinist/pendant"
 description = "Phone thin client for a local herdr server"
+# crates.io `pendant` 0.0.1 is the name reserve. Do not publish from this
+# scaffold. Bump past 0.0.1 and clear publish=false when real code ships.
+publish = false
 
 [workspace.dependencies]
 anyhow = "1"
