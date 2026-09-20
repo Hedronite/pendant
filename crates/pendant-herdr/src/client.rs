@@ -103,6 +103,12 @@ impl HerdrClient {
         self.rpc("agent.get", json!({ "target": target })).await
     }
 
+    /// Focus a tab by id. herdr 0.9.x exposes tab focus, not pane focus;
+    /// the bridge maps a pane target to its owning tab via the snapshot.
+    pub async fn tab_focus(&self, tab_id: &str) -> Result<Value, HerdrError> {
+        self.rpc("tab.focus", json!({ "tab_id": tab_id })).await
+    }
+
     pub async fn ping(&self) -> Result<Value, HerdrError> {
         self.rpc("ping", json!({})).await
     }

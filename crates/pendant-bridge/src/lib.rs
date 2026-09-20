@@ -12,18 +12,51 @@ pub use error::BridgeError;
 
 use std::net::SocketAddr;
 
-use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::{Json, Router};
 use pendant_herdr::HerdrClient;
+use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
+
+/// JSON bodies are small approve/prompt payloads; cap like the prototype.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
     pub herdr: HerdrClient,
+    pub token: Option<String>,
 }
 
 pub fn app(state: AppState) -> Router {
-    routes::router(state).layer(TraceLayer::new_for_http())
+    routes::router(state.clone())
+        .route_layer(middleware::from_fn_with_state(state, bearer_auth))
+        .layer(TraceLayer::new_for_http())
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+}
+
+/// When `PENDANT_TOKEN` is set, every `/v1/*` call needs
+/// `Authorization: Bearer <token>`. Unset = Tailscale mesh is the boundary.
+/// Static PWA assets stay open (they carry no data and hold no secrets).
+async fn bearer_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(token) = &state.token {
+        let ok = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == format!("Bearer {token}"));
+        if !ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":{"code":"unauthorized","message":"bearer token required"}})),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 pub async fn serve(config: Config) -> Result<(), BridgeError> {
@@ -33,6 +66,7 @@ pub async fn serve(config: Config) -> Result<(), BridgeError> {
 
     let state = AppState {
         herdr: HerdrClient::new(&config.herdr_sock),
+        token: config.token.clone(),
     };
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;

@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use futures_util::stream::{self, Stream};
 use pendant_herdr::{CreateWorktree, HerdrError};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::static_files;
 use crate::AppState;
@@ -43,6 +43,42 @@ struct PromptBody {
 #[derive(Deserialize)]
 struct KeysBody {
     keys: Vec<String>,
+}
+
+/// herdr targets look like `wN:p2`, agent names, or session ids — never
+/// flags or paths. Same rule as the Python prototype bridge.
+fn is_valid_target(target: &str) -> bool {
+    !target.is_empty()
+        && target.len() <= 96
+        && !target.starts_with('-')
+        && target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '@' | '/' | '-'))
+}
+
+fn bad_request(code: &str, message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":{"code":code,"message":message.into()}})),
+    )
+        .into_response()
+}
+
+/// Approve/deny surface only. send-keys is key injection by design; keep the
+/// spike whitelist tight so the bridge can't become an arbitrary keyboard.
+/// Digits 1-4 cover numbered option prompts (PWA action bar sends them).
+const KEY_WHITELIST: &[&str] = &[
+    "y", "n", "1", "2", "3", "4", "enter", "esc", "escape", "tab", "space", "up", "down", "left",
+    "right", "ctrl+c", "ctrl+d", "ctrl+z",
+];
+
+/// PWA sends tmux-style `ctrl-c`; herdr wants `ctrl+c`. Lowercase too.
+fn normalize_key(key: &str) -> String {
+    let k = key.trim().to_lowercase();
+    match k.strip_prefix("ctrl-") {
+        Some(rest) => format!("ctrl+{rest}"),
+        None => k,
+    }
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -99,21 +135,28 @@ async fn create_worktree(
 }
 
 async fn agent_detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !is_valid_target(&id) {
+        return bad_request("invalid_target", "invalid target");
+    }
     let snapshot = match state.herdr.snapshot().await {
         Ok(snap) => snap,
         Err(err) => return herdr_error(err),
     };
     let agent = snapshot.agent_by_id(&id).cloned();
+    // Socket returns {type:"pane_read", read:{text}}, CLI fallback returns
+    // {type:"agent_read", text}; the PWA wants one stable string.
     let output = match state.herdr.agent_read(&id).await {
-        Ok(value) => Some(value),
+        Ok(value) => value
+            .pointer("/read/text")
+            .or_else(|| value.get("text"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(value.to_string())),
         Err(HerdrError::Rpc { .. }) => None,
         Err(err) if err.is_transport() => return herdr_error(err),
         Err(_) => None,
     };
-    let get = match state.herdr.agent_get(&id).await {
-        Ok(value) => Some(value),
-        Err(_) => None,
-    };
+    let get = state.herdr.agent_get(&id).await.ok();
     Json(json!({
         "id": id,
         "agent": agent,
@@ -129,12 +172,11 @@ async fn agent_prompt(
     Path(id): Path<String>,
     Json(body): Json<PromptBody>,
 ) -> Response {
+    if !is_valid_target(&id) {
+        return bad_request("invalid_target", "invalid target");
+    }
     if body.prompt.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":{"code":"empty_prompt","message":"prompt must not be empty"}})),
-        )
-            .into_response();
+        return bad_request("empty_prompt", "prompt must not be empty");
     }
     match state.herdr.agent_prompt(&id, &body.prompt).await {
         Ok(value) => Json(value).into_response(),
@@ -147,16 +189,57 @@ async fn agent_keys(
     Path(id): Path<String>,
     Json(body): Json<KeysBody>,
 ) -> Response {
-    if body.keys.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":{"code":"empty_keys","message":"keys must not be empty"}})),
-        )
-            .into_response();
+    if !is_valid_target(&id) {
+        return bad_request("invalid_target", "invalid target");
     }
-    match state.herdr.agent_send_keys(&id, &body.keys).await {
+    if body.keys.is_empty() || body.keys.len() > 8 {
+        return bad_request("empty_keys", "keys must be a list of 1..8 key names");
+    }
+    let keys: Vec<String> = body.keys.iter().map(|k| normalize_key(k)).collect();
+    // "focus" is pane chrome, not key injection: focus the tab owning the
+    // pane (herdr 0.9.x has tab focus, no focus-pane call). Must be alone.
+    if keys.iter().any(|k| k == "focus") {
+        if keys.len() != 1 {
+            return bad_request(
+                "focus_not_alone",
+                "focus cannot be combined with other keys",
+            );
+        }
+        return focus_pane_tab(&state, &id).await;
+    }
+    if let Some(bad) = keys.iter().find(|k| !KEY_WHITELIST.contains(&k.as_str())) {
+        return bad_request(
+            "key_not_whitelisted",
+            format!("key not in approve whitelist: {bad}"),
+        );
+    }
+    match state.herdr.agent_send_keys(&id, &keys).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),
+    }
+}
+
+/// Map a pane target to its owning tab via the snapshot, then `tab.focus`.
+async fn focus_pane_tab(state: &AppState, target: &str) -> Response {
+    let snap = match state.herdr.snapshot().await {
+        Ok(snap) => snap,
+        Err(err) => return herdr_error(err),
+    };
+    let tab = snap
+        .agents
+        .iter()
+        .find(|a| a.pane_id == target || a.id == target)
+        .and_then(|a| a.tab_id.clone());
+    match tab {
+        Some(tab) => match state.herdr.tab_focus(&tab).await {
+            Ok(_) => Json(json!({ "ok": true, "target": target, "tab": tab })).into_response(),
+            Err(err) => herdr_error(err),
+        },
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":{"code":"pane_not_found","message":format!("pane not found in snapshot: {target}")}})),
+        )
+            .into_response(),
     }
 }
 
@@ -217,4 +300,39 @@ fn herdr_error(err: HerdrError) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_validation_matches_prototype_rule() {
+        assert!(is_valid_target("w1:p2"));
+        assert!(is_valid_target("agent-name_1.2"));
+        assert!(is_valid_target("oma@castle"));
+        assert!(!is_valid_target(""));
+        assert!(!is_valid_target("--workspace"));
+        assert!(!is_valid_target("bad target"));
+        assert!(!is_valid_target("a;b"));
+        assert!(!is_valid_target(&"x".repeat(97)));
+    }
+
+    #[test]
+    fn normalize_key_tmux_style_to_herdr() {
+        assert_eq!(normalize_key("ctrl-c"), "ctrl+c");
+        assert_eq!(normalize_key(" CTRL-D "), "ctrl+d");
+        assert_eq!(normalize_key("Y"), "y");
+        assert_eq!(normalize_key("enter"), "enter");
+    }
+
+    #[test]
+    fn whitelist_covers_approve_bar_only() {
+        for k in ["y", "n", "1", "2", "3", "4", "enter", "esc"] {
+            assert!(KEY_WHITELIST.contains(&k), "{k} should be allowed");
+        }
+        for k in ["rm", "ctrl+shift+c", "f5", "a", "ctrl+o"] {
+            assert!(!KEY_WHITELIST.contains(&k), "{k} must be rejected");
+        }
+    }
 }

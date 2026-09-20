@@ -133,6 +133,7 @@ fn cli_args(method: &str, params: &Value) -> Option<Vec<String>> {
             Some(args)
         }
         "agent.get" => Some(vec!["agent".into(), "get".into(), str_param("target")?]),
+        "tab.focus" => Some(vec!["tab".into(), "focus".into(), str_param("tab_id")?]),
         "agent.read" => {
             let mut args = vec![
                 "agent".into(),

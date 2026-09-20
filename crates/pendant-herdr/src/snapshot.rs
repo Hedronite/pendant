@@ -74,7 +74,9 @@ impl Snapshot {
 }
 
 fn unwrap_snapshot_root(raw: &Value) -> &Value {
-    raw.get("result").unwrap_or(raw)
+    let root = raw.get("result").unwrap_or(raw);
+    // herdr 0.9.x nests the payload once more: {result: {snapshot: {...}}}.
+    root.get("snapshot").unwrap_or(root)
 }
 
 fn extract_agents(root: &Value) -> Vec<AgentRecord> {
@@ -182,5 +184,32 @@ mod tests {
         let inbox = snap.inbox();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].kind, "blocked");
+    }
+
+    #[test]
+    fn snapshot_unwraps_result_snapshot_envelope() {
+        // Real herdr 0.9.0 `api snapshot` shape: {result: {snapshot: {...}}}.
+        let raw = json!({
+            "id": "cli:api:snapshot",
+            "result": {
+                "snapshot": {
+                    "agents": [{
+                        "agent": "omp",
+                        "agent_status": "working",
+                        "pane_id": "wN:p2",
+                        "workspace_id": "wN",
+                        "tab_id": "wN:t1",
+                        "terminal_title_stripped": "Pendant spike"
+                    }],
+                    "workspaces": [{ "workspace_id": "wN", "label": "halo" }]
+                }
+            }
+        });
+        let snap = Snapshot::from_raw(raw);
+        assert_eq!(snap.agents.len(), 1);
+        assert_eq!(snap.agents[0].pane_id, "wN:p2");
+        assert_eq!(snap.agents[0].status, "working");
+        assert_eq!(snap.agents[0].title.as_deref(), Some("Pendant spike"));
+        assert_eq!(snap.workspaces.len(), 1);
     }
 }

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
-pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
+pub const DEFAULT_BIND: &str = "127.0.0.1:8780";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BindError {
@@ -36,24 +36,24 @@ mod tests {
     fn default_loopback_ok() {
         let addr = parse_bind(DEFAULT_BIND).unwrap();
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(addr.port(), 8787);
+        assert_eq!(addr.port(), 8780);
     }
 
     #[test]
     fn ipv6_loopback_ok() {
-        let addr = parse_bind("[::1]:8787").unwrap();
+        let addr = parse_bind("[::1]:8780").unwrap();
         assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
     }
 
     #[test]
     fn reject_unspecified_v4() {
-        let err = parse_bind("0.0.0.0:8787").unwrap_err();
+        let err = parse_bind("0.0.0.0:8780").unwrap_err();
         assert!(matches!(err, BindError::Unspecified { .. }));
     }
 
     #[test]
     fn reject_unspecified_v6() {
-        let err = parse_bind("[::]:8787").unwrap_err();
+        let err = parse_bind("[::]:8780").unwrap_err();
         assert!(matches!(err, BindError::Unspecified { .. }));
     }
 

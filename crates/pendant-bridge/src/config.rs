@@ -10,6 +10,9 @@ use crate::error::BridgeError;
 pub struct Config {
     pub bind: SocketAddr,
     pub herdr_sock: PathBuf,
+    /// Optional bearer token required on `/v1/*` (`PENDANT_TOKEN`).
+    /// Unset = Tailscale mesh is the auth boundary.
+    pub token: Option<String>,
 }
 
 impl Config {
@@ -17,13 +20,19 @@ impl Config {
         let bind_raw = std::env::var("PENDANT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
         let sock_raw =
             std::env::var("PENDANT_HERDR_SOCK").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
-        Self::from_raw(&bind_raw, &sock_raw)
+        let mut cfg = Self::from_raw(&bind_raw, &sock_raw)?;
+        cfg.token = std::env::var("PENDANT_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        Ok(cfg)
     }
 
     pub fn from_raw(bind: &str, herdr_sock: &str) -> Result<Self, BridgeError> {
         Ok(Self {
             bind: parse_bind(bind)?,
             herdr_sock: expand_path(herdr_sock),
+            token: None,
         })
     }
 }
@@ -45,7 +54,7 @@ mod tests {
     #[test]
     fn defaults_expand_tilde_and_loopback() {
         let cfg = Config::from_raw(DEFAULT_BIND, DEFAULT_SOCKET_PATH).unwrap();
-        assert_eq!(cfg.bind.to_string(), "127.0.0.1:8787");
+        assert_eq!(cfg.bind.to_string(), "127.0.0.1:8780");
         assert_eq!(cfg.herdr_sock, home_dir().join(".config/herdr/herdr.sock"));
     }
 
