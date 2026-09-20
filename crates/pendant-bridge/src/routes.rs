@@ -128,6 +128,20 @@ async fn create_worktree(
     State(state): State<AppState>,
     Json(body): Json<CreateWorktree>,
 ) -> Response {
+    // Prototype parity: never forward flag-shaped values toward the herdr
+    // CLI fallback argv (`--branch -D` etc.). RPC path is UDS JSON, but the
+    // guard costs nothing and fails closed either way.
+    let fields = [
+        body.workspace_id.as_deref(),
+        body.cwd.as_deref(),
+        body.branch.as_deref(),
+        body.base.as_deref(),
+        body.path.as_deref(),
+        body.label.as_deref(),
+    ];
+    if fields.iter().flatten().any(|v| v.starts_with('-')) {
+        return bad_request("invalid_worktree_field", "worktree fields must not start with '-'");
+    }
     match state.herdr.worktree_create(&body).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),

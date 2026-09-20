@@ -54,7 +54,7 @@ mod tests {
     #[test]
     fn defaults_expand_tilde_and_loopback() {
         let cfg = Config::from_raw(DEFAULT_BIND, DEFAULT_SOCKET_PATH).unwrap();
-        assert_eq!(cfg.bind.to_string(), "127.0.0.1:8780");
+        assert_eq!(cfg.bind.to_string(), "127.0.0.1:8787");
         assert_eq!(cfg.herdr_sock, home_dir().join(".config/herdr/herdr.sock"));
     }
 
