@@ -145,6 +145,92 @@ function agentCard(a) {
 function glyph(a) { const m = { grok: "G", omp: "π", omapi: "π", cursor: "C", codex: "C", claude: "✦", pi: "π" }; return m[a.agent] || (a.agent ? a.agent[0].toUpperCase() : "?"); }
 function labelOf(a) { return a.name || a.title || a.agent || a.id; }
 
+// ---------- Compose sheet (shared by S2) ----------
+function showCompose(target, hint) {
+  const sheet = $("#compose-sheet"), ta = $("#compose-text");
+  sheet.hidden = false; ta.value = ""; ta.placeholder = hint || "Send a prompt…"; ta.focus();
+  sheet._target = target;
+}
+function hideCompose() { const sheet = $("#compose-sheet"); if (sheet) sheet.hidden = true; }
+$("#compose-cancel").addEventListener("click", hideCompose);
+$("#compose-send").addEventListener("click", async () => {
+  const sheet = $("#compose-sheet"); const t = sheet._target; const text = $("#compose-text").value.trim();
+  if (!t || !text) return;
+  hideCompose(); toast("sending…");
+  try { await api.prompt(t, text); toast("sent", "ok"); if (state.route === "agent") renderAgentDetail(currentTarget()); }
+  catch (e) { toast("send failed: " + e.message, "err"); }
+});
+
+// ---------- S2: Agent detail ----------
+async function renderAgentDetail(target) {
+  const r = routeEl(); r.innerHTML = "";
+  if (!target) { r.appendChild(el("div", "empty", '<span class="big">▦</span>No agent selected.')); return; }
+  const back = el("button", "back", "‹"); back.onclick = () => go("agents");
+  r.append(back);
+  let d;
+  try { d = await api.agentDetail(target); }
+  catch (e) { r.appendChild(el("div", "empty", "Couldn't load agent: " + e.message)); return; }
+  const a = d.agent || agents().find((x) => x.id === target) || { id: target, agent: "?", status: "unknown", pane_id: "", workspace_id: "", title: "" };
+  const blocked = !!d.blocked || a.status === "blocked";
+  const head = el("div", "detail-head");
+  head.append(el("div", "avatar", glyph(a)));
+  const meta = el("div", "meta");
+  meta.append(el("div", "name", escapeHtml(labelOf(a))));
+  meta.append(el("div", "sub", (a.workspace_id ? wsLabel(a.workspace_id) + " · " : "") + (a.pane_id || a.id)));
+  head.append(meta, el("span", "chip " + a.status, a.status));
+  r.append(head);
+  const tr = el("div", "transcript");
+  const out = d.output || d.get || "";
+  if (out) { tr.innerHTML = escapeHtml(out).replace(/\n/g, "<span class='ln'></span>\n"); }
+  else { tr.append(el("span", "empty-t", "No output yet.")); }
+  r.append(tr);
+  // overflow actions
+  const ov = el("div", "overflow-row");
+  const promptBtn = el("button", "btn", "Prompt"); promptBtn.onclick = () => showCompose(target);
+  const keysBtn = el("button", "btn", "Send keys");
+  keysBtn.onclick = async () => {
+    const k = prompt("Keys to send (e.g. y, n, enter, ctrl-c):");
+    if (!k) return;
+    try { await api.sendKeys(target, k.split(/\s+/).filter(Boolean)); toast("keys sent", "ok"); }
+    catch (e) { toast("send-keys failed: " + e.message, "err"); }
+  };
+  ov.append(promptBtn, keysBtn); r.append(ov);
+  // blocked action bar (brand-critical gold)
+  if (blocked) {
+    const ab = el("div", "action-bar");
+    ab.append(el("div", "ab-title", "● Blocked — needs your call"));
+    const row = el("div", "ab-row");
+    const deny = el("button", "btn deny", "Deny");
+    deny.onclick = async () => { try { await api.sendKeys(target, ["n"]); toast("denied", "ok"); } catch (e) { toast("deny failed", "err"); } };
+    const approve = el("button", "btn approve", "Approve");
+    approve.onclick = async () => { try { await api.sendKeys(target, ["y"]); toast("approved", "ok"); } catch (e) { toast("approve failed", "err"); } };
+    row.append(deny, approve); ab.append(row); r.append(ab);
+  }
+}
+
+// ---------- S3: Worktrees ----------
+function renderWorktrees() {
+  const r = routeEl(); r.innerHTML = "";
+  const list = workspaces();
+  r.append(el("div", "h", "Worktrees · " + list.length));
+  if (!list.length) { r.appendChild(el("div", "empty", '<span class="big">⎇</span>No worktrees. Create one to spin up an agent.')); }
+  for (const w of list) {
+    const c = el("div", "card");
+    c.append(el("div", "avatar", "⎇"));
+    const body = el("div", "body");
+    const row1 = el("div", "row1");
+    row1.append(el("div", "name", escapeHtml(w.label || w.workspace_id)), el("span", "chip idle", "idle"));
+    body.append(row1, el("div", "ws", w.workspace_id), el("div", "last", escapeHtml(w.cwd || "")));
+    c.append(body);
+    c.onclick = () => go("worktree");
+    r.append(c);
+  }
+  const create = el("button", "btn primary block", "+ New worktree");
+  create.style.marginTop = "12px";
+  create.onclick = () => go("worktree");
+  r.append(create);
+}
+
 // ---------- S4: New worktree ----------
 function field(label, ph, val) {
   const wrap = el("div", "field");
@@ -298,5 +384,3 @@ bindTabs();
 if (STORE.mock) { $("#mock-badge").hidden = false; setDot("warn"); } else setDot("bad");
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => {});
 dispatch(location.hash);
-refresh();
-setInterval(() => { if (!document.hidden) refresh(); }, 8000);

@@ -1,5 +1,5 @@
 // Pendant service worker — installable shell, cache-first for the spike.
-const CACHE = "pendant-v4";
+const CACHE = "pendant-v5";
 const SHELL = [
   "/",
   "/index.html",
