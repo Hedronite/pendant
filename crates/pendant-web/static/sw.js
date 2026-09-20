@@ -1,10 +1,13 @@
 // Pendant service worker — installable shell, cache-first for the spike.
-const CACHE = "pendant-v3";
+const CACHE = "pendant-v4";
 const SHELL = [
   "/",
   "/index.html",
   "/manifest.webmanifest",
-  "/icon.svg",
+  "/icon.jpg",
+  "/mark-dark.jpg",
+  "/mark-light.png",
+  "/wordmark.png",
   "/styles.css",
   "/app.js",
 ];
@@ -26,7 +29,7 @@ self.addEventListener("fetch", (e) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   // Never cache bridge API calls or SSE.
-  if (url.pathname.startsWith("/api/")) return;
+  if (url.pathname.startsWith("/v1/")) return;
   e.respondWith(
     caches.match(req).then((hit) => hit || fetch(req).then((res) => {
       const copy = res.clone();

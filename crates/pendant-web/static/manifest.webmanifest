@@ -1,15 +1,16 @@
 {
   "name": "Pendant",
   "short_name": "Pendant",
-  "description": "Phone shell for herdr agents, worktrees, and approvals. Not a terminal.",
+  "description": "The pendant for your actual computer. Phone shell for herdr agents, worktrees, and approvals. Not a terminal.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0b0d10",
-  "theme_color": "#0b0d10",
+  "background_color": "#111513",
+  "theme_color": "#111513",
   "categories": ["productivity", "developer"],
   "icons": [
-    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+    { "src": "/icon.jpg", "sizes": "any", "type": "image/jpeg", "purpose": "any" },
+    { "src": "/mark-light.png", "sizes": "any", "type": "image/png", "purpose": "maskable" }
   ]
 }
