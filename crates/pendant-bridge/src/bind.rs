@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
-pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
+pub const DEFAULT_BIND: &str = "127.0.0.1:8780";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BindError {
@@ -36,7 +36,7 @@ mod tests {
     fn default_loopback_ok() {
         let addr = parse_bind(DEFAULT_BIND).unwrap();
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(addr.port(), 8787);
+        assert_eq!(addr.port(), 8780);
     }
 
     #[test]
