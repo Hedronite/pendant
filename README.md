@@ -33,9 +33,9 @@ Flags vary by `tailscale` version; this is a placeholder. Open the Serve HTTPS U
 
 ## Security
 
-- Mesh-only. Pendant listens on loopback. Reach it through Tailscale Serve, not the public internet.
+- Tailnet-only. Pendant listens on loopback. Reach it through Tailscale Serve, not the public internet.
 - No WAN bind. Do not put Pendant behind a port-forward or bind it to `0.0.0.0`.
-- Anyone who can open the PWA can prompt agents, send keys, and create worktrees. Treat an unlocked phone on the mesh as operator access.
+- Anyone who can open the PWA can prompt agents, send keys, and create worktrees. Treat an unlocked phone on your tailnet as operator access.
 
 ## Workspace
 
