@@ -268,7 +268,7 @@ async function showInbox() {
       .join("");
   } catch (err) {
     setConn(err.message);
-    view.innerHTML = empty("Inbox needs a live herdr snapshot (poll of blocked/done). OS push is not in this spike.");
+    view.innerHTML = empty("Inbox needs a live herdr snapshot (poll of blocked/done). OS push notifications are not supported yet.");
   }
 }
 
