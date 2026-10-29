@@ -7,17 +7,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use tokio::net::UnixStream;
+
 use crate::cli;
 use crate::error::HerdrError;
 use crate::paths::expand_path;
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::snapshot::{InboxItem, Snapshot};
+use crate::via::{stamp, Via};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug)]
 pub struct HerdrClient {
     socket_path: PathBuf,
+    pub(crate) herdr_bin: PathBuf,
     next_id: Arc<AtomicU64>,
 }
 
@@ -43,8 +47,25 @@ impl HerdrClient {
     pub fn new(socket_path: impl AsRef<Path>) -> Self {
         Self {
             socket_path: socket_path.as_ref().to_path_buf(),
+            herdr_bin: PathBuf::from("herdr"),
             next_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// `bin` is the herdr executable. Transcript tests pass a fake binary
+    /// whose file name is not `herdr`.
+    pub fn with_herdr_bin(socket_path: impl AsRef<Path>, bin: impl Into<PathBuf>) -> Self {
+        let mut client = Self::new(socket_path);
+        client.herdr_bin = bin.into();
+        client
+    }
+
+    pub(crate) fn herdr_bin_path(&self) -> &Path {
+        &self.herdr_bin
+    }
+
+    pub(crate) fn alloc_id(&self) -> String {
+        format!("p-{}", self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
     pub fn from_env_path(raw: &str) -> Self {
@@ -114,27 +135,22 @@ impl HerdrClient {
         }
     }
 
-    /// One-shot `events.subscribe` read of the acknowledgement line.
-    /// Long-lived streaming is owned by the bridge SSE loop (poll fallback).
+    /// Acknowledgement only. The open stream is [`Self::subscribe_events`].
+    /// This drops the connection after the ack. It does not poll.
     pub async fn subscribe_ack(&self) -> Result<Value, HerdrError> {
-        self.rpc(
-            "events.subscribe",
-            json!({
-                "subscriptions": [
-                    { "type": "pane.agent_status_changed" }
-                ]
-            }),
-        )
-        .await
+        let sub = self
+            .subscribe_events(&[json!({ "type": "pane.agent_status_changed" })])
+            .await?;
+        Ok(sub.ack)
     }
 
     pub async fn rpc(&self, method: &str, params: Value) -> Result<Value, HerdrError> {
         match self.rpc_socket(method, params.clone()).await {
-            Ok(value) => Ok(value),
-            Err(sock_err) if sock_err.is_transport() => {
-                tracing::debug!(error = %sock_err, method, "herdr socket unavailable; trying CLI");
-                match cli::rpc_cli(&self.socket_path, method, params).await {
-                    Ok(value) => Ok(value),
+            Ok(value) => Ok(stamp(value, Via::Socket)),
+            Err(sock_err) if self.cli_fallback(&sock_err) => {
+                tracing::debug!(error = %sock_err, method, "herdr socket connect failed; trying CLI");
+                match cli::rpc_cli(&self.herdr_bin, &self.socket_path, method, params).await {
+                    Ok(value) => Ok(stamp(value, Via::Cli)),
                     Err(HerdrError::UnsupportedMethod(method)) => {
                         Err(HerdrError::UnsupportedMethod(method))
                     }
@@ -149,22 +165,38 @@ impl HerdrClient {
         }
     }
 
+    /// CLI only when the path is already a socket inode and connect fails.
+    /// A missing path or a regular file is a wrong path: return before `rpc_cli`.
+    fn cli_fallback(&self, err: &HerdrError) -> bool {
+        match err {
+            HerdrError::Connect { path, .. } => path_is_socket(path),
+            _ => false,
+        }
+    }
+
+    pub(crate) async fn connect_socket(&self) -> Result<UnixStream, HerdrError> {
+        let connect = UnixStream::connect(&self.socket_path);
+        match tokio::time::timeout(RPC_TIMEOUT, connect).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(source)) => Err(HerdrError::Connect {
+                path: self.socket_path.clone(),
+                source,
+            }),
+            Err(_) => Err(HerdrError::Connect {
+                path: self.socket_path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out connecting to herdr socket",
+                ),
+            }),
+        }
+    }
+
     async fn rpc_socket(&self, method: &str, params: Value) -> Result<Value, HerdrError> {
-        let id = format!("p-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = self.alloc_id();
         let request = RpcRequest::new(id.clone(), method, params);
         let line = request.to_line()?;
-
-        let connect = tokio::net::UnixStream::connect(&self.socket_path);
-        let stream = match tokio::time::timeout(RPC_TIMEOUT, connect).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(source)) => {
-                return Err(HerdrError::Connect {
-                    path: self.socket_path.clone(),
-                    source,
-                });
-            }
-            Err(_) => return Err(HerdrError::Timeout),
-        };
+        let stream = self.connect_socket().await?;
 
         let exchange = async {
             let mut stream = stream;
@@ -187,6 +219,21 @@ impl HerdrClient {
             Ok(result) => result,
             Err(_) => Err(HerdrError::Timeout),
         }
+    }
+}
+
+fn path_is_socket(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.file_type().is_socket())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -232,6 +279,8 @@ mod tests {
 
         let client = HerdrClient::new(&sock);
         let snap = client.snapshot().await.unwrap();
+        assert_eq!(snap.via, "socket");
+        assert_eq!(snap.raw["via"], "socket");
         assert_eq!(snap.agents.len(), 1);
         assert_eq!(snap.agents[0].pane_id, "w1:p1");
         assert_eq!(snap.agents[0].status, "idle");
@@ -245,10 +294,80 @@ mod tests {
         assert!(err.is_transport());
     }
 
+    /// Wrong path: the socket file is not there. A fake herdr that would
+    /// succeed must not run. The error is returned before `rpc_cli`.
     #[tokio::test]
-    async fn missing_socket_and_cli_is_unavailable() {
-        let client = HerdrClient::new("/tmp/pendant-definitely-missing.sock");
+    async fn wrong_socket_path_fails_before_rpc_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cli-was-called");
+        let bin = write_fake_herdr(dir.path(), &marker);
+        let missing = dir.path().join("no-such-herdr.sock");
+        let client = HerdrClient::with_herdr_bin(&missing, &bin);
+        let err = client.rpc("session.snapshot", json!({})).await.unwrap_err();
+        assert!(matches!(err, HerdrError::Connect { .. }));
+        assert!(!marker.exists(), "rpc_cli ran for a wrong socket path");
+    }
+
+    /// `via: cli` only when connect to an existing socket inode fails.
+    #[tokio::test]
+    async fn cli_fallback_only_when_socket_connect_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cli-was-called");
+        let bin = write_fake_herdr(dir.path(), &marker);
+        let sock = dir.path().join("refused.sock");
+        let _inode = std::os::unix::net::UnixDatagram::bind(&sock).unwrap();
+        let client = HerdrClient::with_herdr_bin(&sock, &bin);
+        let value = client.rpc("ping", json!({})).await.unwrap();
+        assert_eq!(value["via"], "cli");
+        assert_eq!(value["from"], "cli");
+        assert!(marker.exists());
+    }
+
+    /// A socket that answers an RPC error must not be rewritten by the CLI.
+    #[tokio::test]
+    async fn socket_rpc_error_does_not_fall_through_to_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cli-was-called");
+        let bin = write_fake_herdr(dir.path(), &marker);
+        let sock = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let resp = json!({
+                "id": req["id"],
+                "error": { "code": "nope", "message": "socket said no" }
+            });
+            stream = reader.into_inner();
+            stream
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let client = HerdrClient::with_herdr_bin(&sock, &bin);
         let err = client.rpc("ping", json!({})).await.unwrap_err();
-        assert!(matches!(err, HerdrError::Unavailable { .. }));
+        match err {
+            HerdrError::Rpc { code, .. } => assert_eq!(code, "nope"),
+            other => panic!("expected socket RPC error, got {other}"),
+        }
+        assert!(!marker.exists());
+        server.await.unwrap();
+    }
+
+    fn write_fake_herdr(dir: &std::path::Path, marker: &std::path::Path) -> PathBuf {
+        let path = dir.join("fake-herdr");
+        let marker_q = marker.to_string_lossy().replace('\'', "'\\''");
+        let body = format!(
+            "#!/bin/sh\ntouch '{marker_q}'\nprintf '%s\\n' '{{\"ok\":true,\"from\":\"cli\"}}'\n"
+        );
+        std::fs::write(&path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
     }
 }
