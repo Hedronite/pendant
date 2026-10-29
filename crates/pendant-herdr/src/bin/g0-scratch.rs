@@ -47,30 +47,41 @@ async fn run() -> Result<Value, String> {
 
     let version = herdr_version().await?;
     let client = HerdrClient::new(&socket);
-    let mut snap = client
+    let snap = client
         .snapshot()
         .await
         .map_err(|err| format!("socket snapshot: {err}"))?;
     if snap.via != "socket" {
         return Err(format!("snapshot via was {}, not socket", snap.via));
     }
-    let pane = match first_pane_id(&snap.raw) {
-        Some(id) => id,
-        None => {
-            client
-                .rpc(
-                    "workspace.create",
-                    json!({ "label": "pendant-bridge-g0", "cwd": "/tmp", "focus": true }),
-                )
-                .await
-                .map_err(|err| format!("workspace.create: {err}"))?;
-            snap = client
-                .snapshot()
-                .await
-                .map_err(|err| format!("snapshot after create: {err}"))?;
-            first_pane_id(&snap.raw).ok_or_else(|| "workspace.create did not yield a pane".to_string())?
+    let session_was_empty = first_pane_id(&snap.raw).is_none();
+    let (pane, pane_created_before_marker) = if let Some(id) = first_pane_id(&snap.raw) {
+        (id, None)
+    } else {
+        let created = client
+            .rpc(
+                "workspace.create",
+                json!({ "label": "pendant-bridge-g0", "cwd": "/tmp", "focus": true }),
+            )
+            .await
+            .map_err(|err| format!("workspace.create: {err}"))?;
+        if created.get("via").and_then(Value::as_str) != Some("socket") {
+            return Err("workspace.create was not via socket".into());
         }
+        let id = created
+            .pointer("/root_pane/pane_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                format!("workspace.create returned no pane, so the marker check did not run: {created}")
+            })?;
+        let created_id = id.clone();
+        (id, Some(created_id))
     };
+    if pane.is_empty() {
+        return Err("refusing the marker check with no pane".into());
+    }
 
     let mut sub = client
         .subscribe_events(&[
@@ -246,6 +257,8 @@ async fn run() -> Result<Value, String> {
         "socket": socket.display().to_string(),
         "session": session.clone(),
         "pane_id": pane.clone(),
+        "session_was_empty": session_was_empty,
+        "pane_created_before_marker": pane_created_before_marker,
         "herdr_version": version.trim(),
         "g0b": {
             "polling": false,
