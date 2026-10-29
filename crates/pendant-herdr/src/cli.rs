@@ -7,10 +7,21 @@ use tokio::process::Command;
 use crate::error::HerdrError;
 use crate::protocol::unwrap_result;
 
-pub async fn rpc_cli(socket: &Path, method: &str, params: Value) -> Result<Value, HerdrError> {
-    let args =
-        cli_args(method, &params).ok_or_else(|| HerdrError::UnsupportedMethod(method.into()))?;
-    let output = run_herdr(socket, &args).await?;
+pub async fn rpc_cli(
+    bin: &Path,
+    socket: &Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, HerdrError> {
+    let mut args = Vec::new();
+    if let Some(name) = crate::paths::named_session(socket) {
+        args.push("--session".into());
+        args.push(name);
+    }
+    args.extend(
+        cli_args(method, &params).ok_or_else(|| HerdrError::UnsupportedMethod(method.into()))?,
+    );
+    let output = run_herdr(bin, socket, &args).await?;
     if method == "agent.read" {
         return Ok(json!({
             "type": "agent_read",
@@ -43,13 +54,21 @@ pub async fn rpc_cli(socket: &Path, method: &str, params: Value) -> Result<Value
     Ok(unwrap_result(parsed))
 }
 
-async fn run_herdr(socket: &Path, args: &[String]) -> Result<std::process::Output, HerdrError> {
-    let output = Command::new("herdr")
-        .args(args)
+async fn run_herdr(
+    bin: &Path,
+    socket: &Path,
+    args: &[String],
+) -> Result<std::process::Output, HerdrError> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
         .env("HERDR_SOCKET_PATH", socket)
+        .env_remove("HERDR_SESSION")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::piped());
+    if let Some(name) = crate::paths::named_session(socket) {
+        cmd.env("HERDR_SESSION", name);
+    }
+    let output = cmd.output()
         .await
         .map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {

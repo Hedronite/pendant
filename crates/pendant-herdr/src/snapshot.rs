@@ -4,6 +4,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Snapshot {
     pub raw: Value,
+    /// `socket` or `cli`, copied from the reply. Empty when `from_raw` is
+    /// given a fixture that has no `via` field.
+    pub via: String,
     pub agents: Vec<AgentRecord>,
     pub workspaces: Vec<WorkspaceRecord>,
 }
@@ -44,8 +47,14 @@ impl Snapshot {
         let root = unwrap_snapshot_root(&raw);
         let agents = extract_agents(root);
         let workspaces = extract_workspaces(root);
+        let via = raw
+            .get("via")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         Self {
             raw,
+            via,
             agents,
             workspaces,
         }

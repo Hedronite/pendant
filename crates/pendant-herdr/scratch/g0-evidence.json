@@ -1,0 +1,107 @@
+{
+  "g0b": {
+    "command": "socket pane.report_agent state idle then working, on the open events.subscribe connection",
+    "polling": false,
+    "revision": 0,
+    "revision_event": {
+      "pane_revision": 0,
+      "source": "session.snapshot panes[].revision while the subscribe connection was still open",
+      "wire_event_has_revision_field": false
+    },
+    "status_event": {
+      "data": {
+        "agent": "scratch",
+        "agent_status": "idle",
+        "pane_id": "w1:p1",
+        "workspace_id": "w1"
+      },
+      "event": "pane.agent_status_changed",
+      "via": "socket"
+    },
+    "subscribe_connections": 1
+  },
+  "g0c": {
+    "fake_binary": false,
+    "herdr_version": "herdr 0.9.5",
+    "observe_argv": [
+      "herdr",
+      "--session",
+      "pendant-bridge-g0",
+      "terminal",
+      "session",
+      "observe",
+      "w1:p1",
+      "--cols",
+      "40",
+      "--rows",
+      "20"
+    ]
+  },
+  "g0d": {
+    "cli_pane_read_command": "herdr --session pendant-bridge-g0 pane read w1:p1 --source visible --format ansi",
+    "cli_pane_read_has_marker": true,
+    "full_false": {
+      "command": "herdr --session pendant-bridge-g0 terminal session observe w1:p1 --cols 40 --rows 20",
+      "contains": "\u001b[?2026h\u001b[?25l\u001b]8;;\u001b\\\u001b[1;1H\u001b[0;39;49mPENDANT-BRIDGE-G0-MARKER-7f3a           \u001b[2;1Hevanpincham@Mac tmp %        \u001b[3;23Hprintf\u001b[3;30H'REVCHECK\\n\u001b[4;1HREVCHECK       \u001b[4;17H   \u001b[4;21H \u001b[4;23H      \u001b[4;30H           \u001b[5;1Hevanpincham@Mac\u001b[5;17Htmp\u001b[5;21H%\u001b[6;23Hprintf\u001b[6;30H'REV2\\n'\u001b[7;1H               \u001b[7;17H   \u001b[7;21H \u001b[7;23H      \u001b[7;30H        \u001b[8;1HREV2\u001b[9;1Hevanpincham@Mac\u001b[9;17Htmp\u001b[9;21H%\u001b[10…",
+      "frame": {
+        "bytes": "G1s/MjAyNmgbWz8yNWwbXTg7OxtcG1sxOzFIG1swOzM5OzQ5bVBFTkRBTlQtQlJJREdFLUcwLU1BUktFUi03ZjNhICAgICAgICAgICAbWzI7MUhldmFucGluY2hhbUBNYWMgdG1wICUgICAgICAgIBtbMzsyM0hwcmludGYbWzM7MzBIJ1JFVkNIRUNLXG4bWzQ7MUhSRVZDSEVDSyAgICAgICAbWzQ7MTdIICAgG1s0OzIxSCAbWzQ7MjNIICAgICAgG1s0OzMwSCAgICAgICAgICAgG1s1OzFIZXZhbnBpbmNoYW1ATWFjG1s1OzE3SHRtcBtbNTsyMUglG1s2OzIzSHByaW50ZhtbNjszMEgnUkVWMlxuJxtbNzsxSCAgICAgICAgICAgICAgIBtbNzsxN0ggICAbWzc7MjFIIBtbNzsyM0ggICAgICAbWzc7MzBIICAgICAgICAbWzg7MUhSRVYyG1s5OzFIZXZhbnBpbmNoYW1ATWFjG1s5OzE3SHRtcBtbOTsyMUglG1sxMDsyM0hwcmludGYbWzEwOzMwSCdQRU5EQU5ULUJSG1sxMTsxSFBFTkRBTlQtQlJJREdFLUcwLUlOQ1ItN2YzYSAbWzExOzMwSCAgICAgICAgICAgG1sxMjsxSGV2YW5waW5jaGFtQE1hYyB0bXAgJSAgICAgIBtbMTM7MjNIcHJpbnRmG1sxMzszMEgnUEVOREFOVC1CUhtbMTQ7MUhQRU5EQU5ULUJSSURHRS1HMC1JTkNSLTdmM2EgG1sxNDszMEggICAgICAgICAgIBtbMTU7MUggICAgICAgICAgICAgICAgICAgICAgICAgICAbWzE2OzFIZXZhbnBpbmNoYW1ATWFjG1sxNjsxN0h0bXAbWzE2OzIxSCUbWzE3OzIzSHByaW50ZhtbMTc7MzBIJ1BFTkRBTlQtQlIbWzE4OzFIUEVOREFOVC1CUklER0UtRzAtTUFSS0VSLTdmM2EgICAgICAgICAgIBtbMTk7MUhldmFucGluY2hhbUBNYWMgdG1wICUgICAgICAgIBtbMjA7MjNIcHJpbnRmG1syMDszMEgnUEVOREFOVC1CUhtbMG0bWzIwOzQwSBtbPzI1bBtbPzIwMjZsG1syMDs0MEgbWz8yNWw=",
+        "encoding": "ansi",
+        "full": false,
+        "height": 20,
+        "seq": 2,
+        "type": "terminal.frame",
+        "width": 40
+      }
+    },
+    "marker": "PENDANT-BRIDGE-G0-MARKER-7f3a",
+    "phone_resize": {
+      "after": {
+        "height": 40,
+        "width": 120
+      },
+      "answer": "no",
+      "before": {
+        "height": 40,
+        "width": 120
+      },
+      "command": "socket pane.layout {\"pane_id\":\"w1:p1\"} before and after herdr --session pendant-bridge-g0 terminal session observe w1:p1 --cols 40 --rows 20"
+    },
+    "socket_snapshot_command": "socket pane.read {source:visible, format:ansi}",
+    "socket_snapshot_has_marker": true,
+    "two_observers": {
+      "answer": "yes",
+      "command": "two concurrent `herdr --session pendant-bridge-g0 terminal session observe w1:p1 --cols 40 --rows 20`",
+      "frames_a": 3,
+      "frames_b": 2,
+      "full_flags_a": [
+        {
+          "full": true,
+          "seq": 1
+        },
+        {
+          "full": false,
+          "seq": 2
+        },
+        {
+          "full": false,
+          "seq": 3
+        }
+      ],
+      "full_flags_b": [
+        {
+          "full": true,
+          "seq": 1
+        },
+        {
+          "full": false,
+          "seq": 2
+        }
+      ]
+    }
+  },
+  "herdr_version": "herdr 0.9.5",
+  "ok": true,
+  "pane_id": "w1:p1",
+  "session": "pendant-bridge-g0",
+  "socket": "/Users/evanpincham/.config/herdr/sessions/pendant-bridge-g0/herdr.sock"
+}
