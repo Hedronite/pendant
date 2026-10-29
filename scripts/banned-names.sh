@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-names=()
+raw=()
 while IFS= read -r entry || [[ -n $entry ]]; do
   entry="${entry#"${entry%%[![:space:]]*}"}"
   entry="${entry%"${entry##*[![:space:]]}"}"
@@ -18,10 +18,10 @@ while IFS= read -r entry || [[ -n $entry ]]; do
     echo "BANNED_NAMES has an entry that is not [a-z0-9-]+" >&2
     exit 2
   fi
-  names+=(-e "$entry")
+  raw+=("$entry")
 done < <(printf '%s\n' "${BANNED_NAMES-}" | tr ',' '\n' | tr '[:upper:]' '[:lower:]')
 
-if [[ ${#names[@]} -eq 0 ]]; then
+if [[ ${#raw[@]} -eq 0 ]]; then
   if [[ ${BANNED_NAMES_FORK_PR-} == true ]]; then
     echo "::notice::name check skipped: secrets are not available on a fork pull request"
     exit 0
@@ -31,21 +31,31 @@ if [[ ${#names[@]} -eq 0 ]]; then
 fi
 
 status=0
-files=0
-git grep -l -z -I -i -w -E "${names[@]}" >/dev/null 2>&1 || files=$?
-if [[ $files -gt 1 ]]; then
-  echo "name check failed to run" >&2
-  exit 2
-fi
-if [[ $files -eq 0 ]]; then
-  while IFS= read -r -d '' path; do
-    { git grep -n -h -I -i -w -E "${names[@]}" -- ":(literal)$path" 2>/dev/null || true; } |
-      cut -d: -f1 |
-      while IFS= read -r line; do
-        echo "$path:$line"
-      done
-  done < <(git grep -l -z -I -i -w -E "${names[@]}" 2>/dev/null)
-  echo "banned name in file contents" >&2
+alt=""
+for name in "${raw[@]}"; do
+  if [[ -n $alt ]]; then
+    alt+="|"
+  fi
+  alt+="$name"
+done
+re="(^|[^[:alnum:]])(${alt})($|[^[:alnum:]])"
+
+hits="$(mktemp)"
+trap 'rm -f "$hits"' EXIT
+if git grep -n -I -i -E "$re" >"$hits" 2>/dev/null; then
+  cut -d: -f1,2 "$hits"
   status=1
+fi
+rm -f "$hits"
+
+while IFS= read -r -d '' path; do
+  if printf '%s\n' "$path" | grep -q -i -E "$re"; then
+    echo "$path:1"
+    status=1
+  fi
+done < <(git ls-files -z)
+
+if [[ $status -ne 0 ]]; then
+  echo "banned name in file contents" >&2
 fi
 exit "$status"

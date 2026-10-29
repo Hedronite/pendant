@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 use tokio::net::UnixStream;
 
 use crate::cli;
 use crate::error::HerdrError;
+use crate::line::{read_limited_line, MAX_HERDR_LINE};
 use crate::paths::expand_path;
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::snapshot::{InboxItem, Snapshot};
@@ -211,11 +212,7 @@ impl HerdrClient {
             stream.write_all(line.as_bytes()).await?;
             stream.flush().await?;
             let mut reader = BufReader::new(stream);
-            let mut response_line = String::new();
-            let n = reader.read_line(&mut response_line).await?;
-            if n == 0 {
-                return Err(HerdrError::EmptyResponse);
-            }
+            let response_line = read_limited_line(&mut reader, MAX_HERDR_LINE).await?;
             let parsed: RpcResponse = serde_json::from_str(response_line.trim())?;
             if let Some(err) = parsed.error {
                 return Err(HerdrError::from_rpc(err));
@@ -265,6 +262,7 @@ fn path_is_socket(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::line::MAX_HERDR_LINE;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -378,6 +376,30 @@ mod tests {
             HerdrError::Rpc { code, .. } => assert_eq!(code, "nope"),
             other => panic!("expected socket RPC error, got {other}"),
         }
+        assert!(!marker.exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_reply_longer_than_the_cap_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cli-was-called");
+        let bin = write_fake_herdr(dir.path(), &marker);
+        let sock = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let mut huge = vec![b'x'; MAX_HERDR_LINE + 1];
+            huge.push(b'\n');
+            let mut stream = reader.into_inner();
+            stream.write_all(&huge).await.unwrap();
+        });
+        let client = HerdrClient::with_herdr_bin(&sock, &bin);
+        let err = client.rpc("ping", json!({})).await.unwrap_err();
+        assert!(matches!(err, HerdrError::LineTooLong { limit: MAX_HERDR_LINE }));
         assert!(!marker.exists());
         server.await.unwrap();
     }
