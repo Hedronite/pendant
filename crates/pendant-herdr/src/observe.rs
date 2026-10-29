@@ -165,7 +165,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// Transcript test. This binary is a fake. It is not castle's herdr 0.9.5.
+    /// Transcript test. This binary is a fake. It is not the real herdr 0.9.5.
     #[tokio::test]
     async fn observe_transcript_uses_fake_herdr_binary() {
         let dir = tempfile::tempdir().unwrap();

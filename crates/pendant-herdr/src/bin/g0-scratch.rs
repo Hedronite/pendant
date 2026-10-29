@@ -1,7 +1,7 @@
 //! Scratch-session check for Pendant bridge G0.
 //!
 //! Runs against `~/.config/herdr/sessions/<name>/herdr.sock` only.
-//! Spawns the `herdr` on `PATH` (castle's 0.9.5). Does not build.
+//! Spawns the `herdr` on `PATH` (0.9.5). Does not build.
 
 use std::path::Path;
 use std::process::Stdio;

@@ -51,9 +51,9 @@
     "cli_pane_read_has_marker": true,
     "full_false": {
       "command": "herdr --session pendant-bridge-g0 terminal session observe w2:p1 --cols 40 --rows 20",
-      "contains": "\u001b[?2026h\u001b[?25l\u001b]8;;\u001b\\\u001b[1;11H\u001b[0;39;49m3\u001b[2;11H4\u001b[3;11H5\u001b[4;11H6\u001b[5;11H7\u001b[6;11H8\u001b[7;11H9\u001b[8;10H30\u001b[9;10H31\u001b[10;10H32\u001b[11;11H3\u001b[12;11H4\u001b[13;11H5\u001b[14;11H6\u001b[15;11H7\u001b[16;11H8\u001b[17;11H9\u001b[18;10H40\u001b[19;1Hevanpincham@Mac\u001b[19;17Htmp\u001b[19;21H%\u001b[20;1Hevanpincham@Mac\u001b[20;17Htmp\u001b[20;21H%\u001b[20;23Hprintf\u001b[20;30H'QA-OBS-INC\u001b[0m\u001b[20;40H\u001b[?25l\u001b[?2026l\u001b[20;40H\u001b[?25l",
+      "contains": "\u001b[?2026h\u001b[?25l\u001b]8;;\u001b\\\u001b[1;11H\u001b[0;39;49m3\u001b[2;11H4\u001b[3;11H5\u001b[4;11H6\u001b[5;11H7\u001b[6;11H8\u001b[7;11H9\u001b[8;10H30\u001b[9;10H31\u001b[10;10H32\u001b[11;11H3\u001b[12;11H4\u001b[13;11H5\u001b[14;11H6\u001b[15;11H7\u001b[16;11H8\u001b[17;11H9\u001b[18;10H40\u001b[19;1Huser@host\u001b[19;17Htmp\u001b[19;21H%\u001b[20;1Huser@host\u001b[20;17Htmp\u001b[20;21H%\u001b[20;23Hprintf\u001b[20;30H'QA-OBS-INC\u001b[0m\u001b[20;40H\u001b[?25l\u001b[?2026l\u001b[20;40H\u001b[?25l",
       "frame": {
-        "bytes": "G1s/MjAyNmgbWz8yNWwbXTg7OxtcG1sxOzExSBtbMDszOTs0OW0zG1syOzExSDQbWzM7MTFINRtbNDsxMUg2G1s1OzExSDcbWzY7MTFIOBtbNzsxMUg5G1s4OzEwSDMwG1s5OzEwSDMxG1sxMDsxMEgzMhtbMTE7MTFIMxtbMTI7MTFINBtbMTM7MTFINRtbMTQ7MTFINhtbMTU7MTFINxtbMTY7MTFIOBtbMTc7MTFIORtbMTg7MTBINDAbWzE5OzFIZXZhbnBpbmNoYW1ATWFjG1sxOTsxN0h0bXAbWzE5OzIxSCUbWzIwOzFIZXZhbnBpbmNoYW1ATWFjG1syMDsxN0h0bXAbWzIwOzIxSCUbWzIwOzIzSHByaW50ZhtbMjA7MzBIJ1FBLU9CUy1JTkMbWzBtG1syMDs0MEgbWz8yNWwbWz8yMDI2bBtbMjA7NDBIG1s/MjVs",
+        "bytes": "G1s/MjAyNmgbWz8yNWwbXTg7OxtcG1sxOzExSBtbMDszOTs0OW0zG1syOzExSDQbWzM7MTFINRtbNDsxMUg2G1s1OzExSDcbWzY7MTFIOBtbNzsxMUg5G1s4OzEwSDMwG1s5OzEwSDMxG1sxMDsxMEgzMhtbMTE7MTFIMxtbMTI7MTFINBtbMTM7MTFINRtbMTQ7MTFINhtbMTU7MTFINxtbMTY7MTFIOBtbMTc7MTFIORtbMTg7MTBINDAbWzE5OzFIdXNlckBob3N0G1sxOTsxN0h0bXAbWzE5OzIxSCUbWzIwOzFIdXNlckBob3N0G1syMDsxN0h0bXAbWzIwOzIxSCUbWzIwOzIzSHByaW50ZhtbMjA7MzBIJ1FBLU9CUy1JTkMbWzBtG1syMDs0MEgbWz8yNWwbWz8yMDI2bBtbMjA7NDBIG1s/MjVs",
         "encoding": "ansi",
         "full": false,
         "height": 20,
@@ -112,5 +112,5 @@
   "pane_id": "w2:p1",
   "session": "pendant-bridge-g0",
   "session_was_empty": false,
-  "socket": "/Users/evanpincham/.config/herdr/sessions/pendant-bridge-g0/herdr.sock"
+  "socket": "~/.config/herdr/sessions/pendant-bridge-g0/herdr.sock"
 }
