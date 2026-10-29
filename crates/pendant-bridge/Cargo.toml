@@ -9,7 +9,7 @@ publish.workspace = true
 description = "Loopback HTTP bridge from Pendant to herdr"
 
 [dependencies]
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 futures-util.workspace = true
 mime_guess.workspace = true
 pendant-herdr = { path = "../pendant-herdr" }
@@ -21,3 +21,9 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+tokio-tungstenite = "0.29"
+tempfile.workspace = true

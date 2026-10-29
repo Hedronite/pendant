@@ -4,6 +4,7 @@ mod bind;
 mod config;
 mod error;
 mod routes;
+mod session;
 mod static_files;
 
 pub use bind::{parse_bind, BindError, DEFAULT_BIND};
@@ -20,6 +21,7 @@ use tower_http::trace::TraceLayer;
 #[derive(Clone)]
 pub struct AppState {
     pub herdr: HerdrClient,
+    pub queue_cap: usize,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -33,6 +35,7 @@ pub async fn serve(config: Config) -> Result<(), BridgeError> {
 
     let state = AppState {
         herdr: HerdrClient::new(&config.herdr_sock),
+        queue_cap: 32,
     };
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
