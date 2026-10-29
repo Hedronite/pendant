@@ -22,6 +22,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(8);
 pub struct HerdrClient {
     socket_path: PathBuf,
     pub(crate) herdr_bin: PathBuf,
+    pub(crate) ack_timeout: Duration,
     next_id: Arc<AtomicU64>,
 }
 
@@ -47,17 +48,24 @@ impl HerdrClient {
     pub fn new(socket_path: impl AsRef<Path>) -> Self {
         Self {
             socket_path: socket_path.as_ref().to_path_buf(),
-            herdr_bin: PathBuf::from("herdr"),
+            herdr_bin: resolve_executable(PathBuf::from("herdr")),
+            ack_timeout: Duration::from_secs(8),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    /// `bin` is the herdr executable. Transcript tests pass a fake binary
-    /// whose file name is not `herdr`.
+    /// `bin` is the herdr executable. An absolute path is used as given.
+    /// A name is resolved on `PATH` at startup. Transcript tests pass a
+    /// binary whose file name is not `herdr`.
     pub fn with_herdr_bin(socket_path: impl AsRef<Path>, bin: impl Into<PathBuf>) -> Self {
         let mut client = Self::new(socket_path);
-        client.herdr_bin = bin.into();
+        client.herdr_bin = resolve_executable(bin.into());
         client
+    }
+
+    pub fn with_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.ack_timeout = timeout;
+        self
     }
 
     pub(crate) fn herdr_bin_path(&self) -> &Path {
@@ -220,6 +228,23 @@ impl HerdrClient {
             Err(_) => Err(HerdrError::Timeout),
         }
     }
+}
+
+/// An absolute path is kept. A bare name is the first match on `PATH`.
+pub(crate) fn resolve_executable(bin: PathBuf) -> PathBuf {
+    if bin.is_absolute() {
+        return bin;
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return bin;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(&bin);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    bin
 }
 
 fn path_is_socket(path: &Path) -> bool {

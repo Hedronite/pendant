@@ -12,6 +12,7 @@
 mod cli;
 mod client;
 mod error;
+mod line;
 mod observe;
 mod paths;
 mod protocol;

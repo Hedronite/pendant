@@ -18,3 +18,24 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo test
         run: cargo test --workspace
+
+  banned-names:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fixture
+        run: scripts/banned-names-fixture.sh
+      - name: banned names
+        env:
+          BANNED_NAMES: ${{ secrets.BANNED_NAMES }}
+          BANNED_NAMES_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: scripts/banned-names.sh
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
