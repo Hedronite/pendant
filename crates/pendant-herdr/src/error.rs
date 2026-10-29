@@ -26,6 +26,12 @@ pub enum HerdrError {
         message: String,
         body: Option<RpcError>,
     },
+    #[error("herdr line exceeded {limit} bytes")]
+    LineTooLong { limit: usize },
+    #[error("herdr line is not utf-8")]
+    InvalidLine,
+    #[error("observe target must not start with '-'")]
+    BadObserveTarget,
     #[error("herdr CLI not found on PATH")]
     CliMissing,
     #[error("herdr CLI failed ({status}): {stderr}")]

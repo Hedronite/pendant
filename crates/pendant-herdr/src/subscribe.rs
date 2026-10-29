@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
 
 use crate::error::HerdrError;
+use crate::line::{read_limited_line, MAX_HERDR_LINE};
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::via::{stamp, Via};
 use crate::HerdrClient;
@@ -28,11 +29,7 @@ impl EventStream {
     /// it yields lines. Herdr 0.9.5 status events do not carry `revision`;
     /// `seq` is not copied from a snapshot or from the payload.
     pub async fn next_event(&mut self) -> Result<Value, HerdrError> {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(HerdrError::EmptyResponse);
-        }
+        let line = read_limited_line(&mut self.reader, MAX_HERDR_LINE).await?;
         let parsed: Value = serde_json::from_str(line.trim())?;
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -62,11 +59,15 @@ impl HerdrClient {
         write.flush().await?;
 
         let mut reader = BufReader::new(read);
-        let mut ack_line = String::new();
-        let n = reader.read_line(&mut ack_line).await?;
-        if n == 0 {
-            return Err(HerdrError::EmptyResponse);
-        }
+        let ack_line = match tokio::time::timeout(
+            self.ack_timeout,
+            read_limited_line(&mut reader, MAX_HERDR_LINE),
+        )
+        .await
+        {
+            Ok(line) => line?,
+            Err(_) => return Err(HerdrError::Timeout),
+        };
         let parsed: RpcResponse = serde_json::from_str(ack_line.trim())?;
         if let Some(reply_id) = parsed.id.as_deref() {
             if !reply_id.is_empty() && reply_id != id && !reply_id.starts_with(&format!("{id}:sub:"))
@@ -108,6 +109,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
     /// Polling is off. Two status lines are read from the socket. This stream
@@ -201,5 +203,24 @@ mod tests {
         assert!(seq1 < seq2, "seq {seq1} then {seq2} is not increasing");
         assert_eq!(accepts.load(Ordering::SeqCst), 1);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_ack_times_out_when_the_peer_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        });
+
+        let client = HerdrClient::new(&sock).with_ack_timeout(Duration::from_millis(50));
+        let result = client
+            .subscribe_events(&[json!({ "type": "pane.agent_status_changed", "pane_id": "w1:p1" })])
+            .await;
+        assert!(matches!(result, Err(HerdrError::Timeout)));
+        server.abort();
     }
 }

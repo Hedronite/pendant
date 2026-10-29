@@ -2,10 +2,11 @@ use std::process::Stdio;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
 use crate::error::HerdrError;
+use crate::line::{read_limited_line, MAX_HERDR_LINE};
 use crate::paths::named_session;
 use crate::HerdrClient;
 
@@ -46,15 +47,17 @@ pub struct ObserveSession {
 impl ObserveSession {
     pub async fn next_frame(&mut self) -> Result<TerminalFrame, HerdrError> {
         loop {
-            let mut line = String::new();
-            let n = self.stdout.read_line(&mut line).await?;
-            if n == 0 {
-                let status = self.child.wait().await.ok();
-                return Err(HerdrError::CliFailed {
-                    status: status.and_then(|s| s.code()).unwrap_or(1),
-                    stderr: "observe stdout closed".into(),
-                });
-            }
+            let line = match read_limited_line(&mut self.stdout, MAX_HERDR_LINE).await {
+                Ok(line) => line,
+                Err(HerdrError::EmptyResponse) => {
+                    let status = self.child.wait().await.ok();
+                    return Err(HerdrError::CliFailed {
+                        status: status.and_then(|s| s.code()).unwrap_or(1),
+                        stderr: "observe stdout closed".into(),
+                    });
+                }
+                Err(err) => return Err(err),
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -92,6 +95,9 @@ impl HerdrClient {
         cols: u16,
         rows: u16,
     ) -> Result<ObserveSession, HerdrError> {
+        if target.starts_with('-') {
+            return Err(HerdrError::BadObserveTarget);
+        }
         let cols_s = cols.to_string();
         let rows_s = rows.to_string();
         let mut argv = Vec::new();
@@ -185,6 +191,8 @@ mod tests {
             .join(".config/herdr/sessions/pendant-bridge-g0/herdr.sock");
         let client = HerdrClient::with_herdr_bin(&sock, &script);
         let mut session = client.observe("w1:p1", 40, 12).await.unwrap();
+        assert!(script.is_absolute());
+        assert_eq!(session.argv[0], script.to_string_lossy());
         assert!(session.fake_binary, "transcript test must say the binary is fake");
         assert!(session.argv.iter().any(|a| a == "observe"));
         assert!(session.argv.iter().any(|a| a == "--session"));
@@ -204,6 +212,27 @@ mod tests {
         assert!(logged.contains("terminal"));
         assert!(logged.contains("observe"));
         assert!(logged.contains("w1:p1"));
+    }
+
+    #[tokio::test]
+    async fn observe_target_starting_with_dash_does_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let script = dir.path().join("fake-herdr");
+        let marker_q = marker.to_string_lossy().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{marker_q}'\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let client = HerdrClient::with_herdr_bin(dir.path().join("herdr.sock"), &script);
+        let result = client.observe("-pane", 40, 12).await;
+        assert!(matches!(result, Err(HerdrError::BadObserveTarget)));
+        assert!(!marker.exists(), "a child was spawned");
     }
 
     fn shell_quote(path: &std::path::Path) -> String {

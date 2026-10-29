@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 use tokio::net::UnixStream;
 
 use crate::cli;
 use crate::error::HerdrError;
+use crate::line::{read_limited_line, MAX_HERDR_LINE};
 use crate::paths::expand_path;
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::snapshot::{InboxItem, Snapshot};
@@ -22,6 +23,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(8);
 pub struct HerdrClient {
     socket_path: PathBuf,
     pub(crate) herdr_bin: PathBuf,
+    pub(crate) ack_timeout: Duration,
     next_id: Arc<AtomicU64>,
 }
 
@@ -47,17 +49,24 @@ impl HerdrClient {
     pub fn new(socket_path: impl AsRef<Path>) -> Self {
         Self {
             socket_path: socket_path.as_ref().to_path_buf(),
-            herdr_bin: PathBuf::from("herdr"),
+            herdr_bin: resolve_executable(PathBuf::from("herdr")),
+            ack_timeout: Duration::from_secs(8),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    /// `bin` is the herdr executable. Transcript tests pass a fake binary
-    /// whose file name is not `herdr`.
+    /// `bin` is the herdr executable. An absolute path is used as given.
+    /// A name is resolved on `PATH` at startup. Transcript tests pass a
+    /// binary whose file name is not `herdr`.
     pub fn with_herdr_bin(socket_path: impl AsRef<Path>, bin: impl Into<PathBuf>) -> Self {
         let mut client = Self::new(socket_path);
-        client.herdr_bin = bin.into();
+        client.herdr_bin = resolve_executable(bin.into());
         client
+    }
+
+    pub fn with_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.ack_timeout = timeout;
+        self
     }
 
     pub(crate) fn herdr_bin_path(&self) -> &Path {
@@ -203,11 +212,7 @@ impl HerdrClient {
             stream.write_all(line.as_bytes()).await?;
             stream.flush().await?;
             let mut reader = BufReader::new(stream);
-            let mut response_line = String::new();
-            let n = reader.read_line(&mut response_line).await?;
-            if n == 0 {
-                return Err(HerdrError::EmptyResponse);
-            }
+            let response_line = read_limited_line(&mut reader, MAX_HERDR_LINE).await?;
             let parsed: RpcResponse = serde_json::from_str(response_line.trim())?;
             if let Some(err) = parsed.error {
                 return Err(HerdrError::from_rpc(err));
@@ -220,6 +225,23 @@ impl HerdrClient {
             Err(_) => Err(HerdrError::Timeout),
         }
     }
+}
+
+/// An absolute path is kept. A bare name is the first match on `PATH`.
+pub(crate) fn resolve_executable(bin: PathBuf) -> PathBuf {
+    if bin.is_absolute() {
+        return bin;
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return bin;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(&bin);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    bin
 }
 
 fn path_is_socket(path: &Path) -> bool {
@@ -240,6 +262,7 @@ fn path_is_socket(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::line::MAX_HERDR_LINE;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -353,6 +376,30 @@ mod tests {
             HerdrError::Rpc { code, .. } => assert_eq!(code, "nope"),
             other => panic!("expected socket RPC error, got {other}"),
         }
+        assert!(!marker.exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_reply_longer_than_the_cap_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cli-was-called");
+        let bin = write_fake_herdr(dir.path(), &marker);
+        let sock = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let mut huge = vec![b'x'; MAX_HERDR_LINE + 1];
+            huge.push(b'\n');
+            let mut stream = reader.into_inner();
+            stream.write_all(&huge).await.unwrap();
+        });
+        let client = HerdrClient::with_herdr_bin(&sock, &bin);
+        let err = client.rpc("ping", json!({})).await.unwrap_err();
+        assert!(matches!(err, HerdrError::LineTooLong { limit: MAX_HERDR_LINE }));
         assert!(!marker.exists());
         server.await.unwrap();
     }
