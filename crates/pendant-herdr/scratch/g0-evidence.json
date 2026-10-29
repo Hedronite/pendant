@@ -2,22 +2,31 @@
   "g0b": {
     "command": "socket pane.report_agent state idle then working, on the open events.subscribe connection",
     "polling": false,
-    "revision": 0,
-    "revision_event": {
-      "pane_revision": 0,
-      "source": "session.snapshot panes[].revision while the subscribe connection was still open",
-      "wire_event_has_revision_field": false
-    },
-    "status_event": {
-      "data": {
-        "agent": "scratch",
-        "agent_status": "idle",
-        "pane_id": "w2:p1",
-        "workspace_id": "w2"
+    "seq_increases": true,
+    "status_events": [
+      {
+        "data": {
+          "agent": "scratch",
+          "agent_status": "idle",
+          "pane_id": "w2:p1",
+          "workspace_id": "w2"
+        },
+        "event": "pane.agent_status_changed",
+        "seq": 1,
+        "via": "socket"
       },
-      "event": "pane.agent_status_changed",
-      "via": "socket"
-    },
+      {
+        "data": {
+          "agent": "scratch",
+          "agent_status": "working",
+          "pane_id": "w2:p1",
+          "workspace_id": "w2"
+        },
+        "event": "pane.agent_status_changed",
+        "seq": 2,
+        "via": "socket"
+      }
+    ],
     "subscribe_connections": 1
   },
   "g0c": {
@@ -42,9 +51,9 @@
     "cli_pane_read_has_marker": true,
     "full_false": {
       "command": "herdr --session pendant-bridge-g0 terminal session observe w2:p1 --cols 40 --rows 20",
-      "contains": "\u001b[?2026h\u001b[?25l\u001b]8;;\u001b\\\u001b[4;23H\u001b[0;39;49mprintf\u001b[4;30H'PENDANT-BR\u001b[5;1HPENDANT-BRIDGE-G0-INCR-7f3a\u001b[6;1Hevanpincham@Mac\u001b[6;17Htmp\u001b[6;21H%\u001b[7;1Hevanpincham@Mac\u001b[7;17Htmp\u001b[7;21H%\u001b[0m\u001b[7;23H\u001b[?25h\u001b[?2026l\u001b[7;23H\u001b[?25h",
+      "contains": "\u001b[?2026h\u001b[?25l\u001b]8;;\u001b\\\u001b[1;11H\u001b[0;39;49m3\u001b[2;11H4\u001b[3;11H5\u001b[4;11H6\u001b[5;11H7\u001b[6;11H8\u001b[7;11H9\u001b[8;10H30\u001b[9;10H31\u001b[10;10H32\u001b[11;11H3\u001b[12;11H4\u001b[13;11H5\u001b[14;11H6\u001b[15;11H7\u001b[16;11H8\u001b[17;11H9\u001b[18;10H40\u001b[19;1Hevanpincham@Mac\u001b[19;17Htmp\u001b[19;21H%\u001b[20;1Hevanpincham@Mac\u001b[20;17Htmp\u001b[20;21H%\u001b[20;23Hprintf\u001b[20;30H'QA-OBS-INC\u001b[0m\u001b[20;40H\u001b[?25l\u001b[?2026l\u001b[20;40H\u001b[?25l",
       "frame": {
-        "bytes": "G1s/MjAyNmgbWz8yNWwbXTg7OxtcG1s0OzIzSBtbMDszOTs0OW1wcmludGYbWzQ7MzBIJ1BFTkRBTlQtQlIbWzU7MUhQRU5EQU5ULUJSSURHRS1HMC1JTkNSLTdmM2EbWzY7MUhldmFucGluY2hhbUBNYWMbWzY7MTdIdG1wG1s2OzIxSCUbWzc7MUhldmFucGluY2hhbUBNYWMbWzc7MTdIdG1wG1s3OzIxSCUbWzBtG1s3OzIzSBtbPzI1aBtbPzIwMjZsG1s3OzIzSBtbPzI1aA==",
+        "bytes": "G1s/MjAyNmgbWz8yNWwbXTg7OxtcG1sxOzExSBtbMDszOTs0OW0zG1syOzExSDQbWzM7MTFINRtbNDsxMUg2G1s1OzExSDcbWzY7MTFIOBtbNzsxMUg5G1s4OzEwSDMwG1s5OzEwSDMxG1sxMDsxMEgzMhtbMTE7MTFIMxtbMTI7MTFINBtbMTM7MTFINRtbMTQ7MTFINhtbMTU7MTFINxtbMTY7MTFIOBtbMTc7MTFIORtbMTg7MTBINDAbWzE5OzFIZXZhbnBpbmNoYW1ATWFjG1sxOTsxN0h0bXAbWzE5OzIxSCUbWzIwOzFIZXZhbnBpbmNoYW1ATWFjG1syMDsxN0h0bXAbWzIwOzIxSCUbWzIwOzIzSHByaW50ZhtbMjA7MzBIJ1FBLU9CUy1JTkMbWzBtG1syMDs0MEgbWz8yNWwbWz8yMDI2bBtbMjA7NDBIG1s/MjVs",
         "encoding": "ansi",
         "full": false,
         "height": 20,
@@ -99,9 +108,9 @@
   },
   "herdr_version": "herdr 0.9.5",
   "ok": true,
-  "pane_created_before_marker": "w2:p1",
+  "pane_created_before_marker": null,
   "pane_id": "w2:p1",
   "session": "pendant-bridge-g0",
-  "session_was_empty": true,
+  "session_was_empty": false,
   "socket": "/Users/evanpincham/.config/herdr/sessions/pendant-bridge-g0/herdr.sock"
 }

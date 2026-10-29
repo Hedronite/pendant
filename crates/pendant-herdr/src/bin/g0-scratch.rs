@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use pendant_herdr::{named_session, revision_of, HerdrClient};
+use pendant_herdr::{named_session, HerdrClient};
 use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -115,19 +115,8 @@ async fn run() -> Result<Value, String> {
         .await
         .map_err(|err| format!("report working: {err}"))?;
 
-    let (status_event, mut revision_event, mut revision) = collect_status(&mut sub.events).await?;
-    if revision.is_none() {
-        let at_event = client
-            .snapshot()
-            .await
-            .map_err(|err| format!("snapshot at status event: {err}"))?;
-        revision = pane_revision(&at_event.raw, &pane);
-        revision_event = json!({
-            "wire_event_has_revision_field": false,
-            "pane_revision": revision,
-            "source": "session.snapshot panes[].revision while the subscribe connection was still open"
-        });
-    }
+    let status_events = collect_status(&mut sub.events).await?;
+    let seq_increases = seq_increases(&status_events);
 
     let layout_before = client
         .rpc("pane.layout", json!({ "pane_id": pane }))
@@ -248,7 +237,7 @@ async fn run() -> Result<Value, String> {
     let ok = version_ok
         && marker_socket
         && marker_cli
-        && revision.is_some()
+        && seq_increases
         && !full_false_text.is_empty()
         && !frames_a.is_empty();
 
@@ -263,9 +252,8 @@ async fn run() -> Result<Value, String> {
         "g0b": {
             "polling": false,
             "subscribe_connections": 1,
-            "status_event": status_event,
-            "revision_event": revision_event,
-            "revision": revision,
+            "status_events": status_events,
+            "seq_increases": seq_increases,
             "command": "socket pane.report_agent state idle then working, on the open events.subscribe connection"
         },
         "g0c": {
@@ -369,14 +357,9 @@ async fn herdr_output(socket: &Path, session: &str, args: &[String]) -> Result<S
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-async fn collect_status(
-    events: &mut pendant_herdr::EventStream,
-) -> Result<(Value, Value, Option<u64>), String> {
+async fn collect_status(events: &mut pendant_herdr::EventStream) -> Result<Vec<Value>, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    let mut status_event = Value::Null;
-    let mut revision_event = Value::Null;
-    let mut revision = None;
-    let mut seen_status = false;
+    let mut matched = Vec::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let next = timeout(remaining, events.next_event()).await;
@@ -388,40 +371,54 @@ async fn collect_status(
         if event.get("via").and_then(Value::as_str) != Some("socket") {
             return Err("event was not via socket".into());
         }
+        if event.get("seq").and_then(Value::as_u64).is_none() {
+            return Err("subscribe event has no seq".into());
+        }
         let name = event
             .get("event")
             .and_then(Value::as_str)
-            .or_else(|| event.get("type").and_then(Value::as_str))
             .unwrap_or("");
         if name.contains("agent_status") {
             let status = event
                 .pointer("/data/agent_status")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if status != "unknown" || !seen_status {
-                status_event = event.clone();
-                seen_status = true;
-            }
-            if let Some(rev) = revision_of(&event) {
-                revision = Some(rev);
-                revision_event = event;
-                break;
-            }
-            if seen_status && status != "unknown" {
-                break;
-            }
-        } else if seen_status {
-            if let Some(rev) = revision_of(&event) {
-                revision = Some(rev);
-                revision_event = event;
-                break;
+            if status == "idle" || status == "working" {
+                matched.push(event);
             }
         }
+        let saw_idle = matched.iter().any(|event| status_of(event) == "idle");
+        let saw_working = matched.iter().any(|event| status_of(event) == "working");
+        if saw_idle && saw_working {
+            break;
+        }
     }
-    if !seen_status {
-        return Err("no status event arrived on the subscribe connection".into());
+    if !seq_increases(&matched) {
+        return Err(format!(
+            "two live status changes did not show an increasing seq: {matched:?}"
+        ));
     }
-    Ok((status_event, revision_event, revision))
+    Ok(matched)
+}
+
+fn status_of(event: &Value) -> &str {
+    event
+        .pointer("/data/agent_status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn seq_increases(events: &[Value]) -> bool {
+    let idle = events.iter().find(|event| status_of(event) == "idle");
+    let working = events.iter().find(|event| status_of(event) == "working");
+    match (idle, working) {
+        (Some(idle), Some(working)) => {
+            let idle_seq = idle.get("seq").and_then(Value::as_u64);
+            let working_seq = working.get("seq").and_then(Value::as_u64);
+            matches!((idle_seq, working_seq), (Some(earlier), Some(later)) if earlier < later)
+        }
+        _ => false,
+    }
 }
 
 async fn read_frames(
@@ -449,29 +446,6 @@ fn frame_flags(frames: &[Value]) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn pane_revision(raw: &Value, pane_id: &str) -> Option<u64> {
-    fn walk(value: &Value, pane_id: &str) -> Option<u64> {
-        match value {
-            Value::Object(map) => {
-                if map.get("pane_id").and_then(Value::as_str) == Some(pane_id) {
-                    if let Some(revision) = map.get("revision").and_then(Value::as_u64) {
-                        return Some(revision);
-                    }
-                }
-                for child in map.values() {
-                    if let Some(revision) = walk(child, pane_id) {
-                        return Some(revision);
-                    }
-                }
-                None
-            }
-            Value::Array(items) => items.iter().find_map(|child| walk(child, pane_id)),
-            _ => None,
-        }
-    }
-    walk(raw, pane_id)
 }
 
 fn first_pane_id(raw: &Value) -> Option<String> {

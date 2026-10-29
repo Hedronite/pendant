@@ -27,5 +27,5 @@ pub use paths::{
 };
 pub use protocol::{RpcError, RpcRequest, RpcResponse};
 pub use snapshot::{AgentRecord, InboxItem, Snapshot, WorkspaceRecord};
-pub use subscribe::{revision_of, EventStream, Subscription};
+pub use subscribe::{EventStream, Subscription};
 pub use via::Via;

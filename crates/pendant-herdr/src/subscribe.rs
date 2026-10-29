@@ -18,10 +18,15 @@ pub struct Subscription {
 pub struct EventStream {
     reader: BufReader<OwnedReadHalf>,
     _keep: tokio::net::unix::OwnedWriteHalf,
+    next_seq: u64,
 }
 
 impl EventStream {
-    /// Next event from the same connection. `via` is `socket`.
+    /// Next event from the same connection.
+    ///
+    /// `via` is `socket`. `seq` is a monotonic counter this stream stamps as
+    /// it yields lines. Herdr 0.9.5 status events do not carry `revision`;
+    /// `seq` is not copied from a snapshot or from the payload.
     pub async fn next_event(&mut self) -> Result<Value, HerdrError> {
         let mut line = String::new();
         let n = self.reader.read_line(&mut line).await?;
@@ -29,7 +34,13 @@ impl EventStream {
             return Err(HerdrError::EmptyResponse);
         }
         let parsed: Value = serde_json::from_str(line.trim())?;
-        Ok(stamp(parsed, Via::Socket))
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        let mut event = stamp(parsed, Via::Socket);
+        if let Some(map) = event.as_object_mut() {
+            map.insert("seq".into(), Value::from(seq));
+        }
+        Ok(event)
     }
 }
 
@@ -84,27 +95,9 @@ impl HerdrClient {
             events: EventStream {
                 reader,
                 _keep: write,
+                next_seq: 1,
             },
         })
-    }
-}
-
-/// First `revision` number on this value, depth-first.
-pub fn revision_of(value: &Value) -> Option<u64> {
-    match value {
-        Value::Object(map) => {
-            if let Some(n) = map.get("revision").and_then(Value::as_u64) {
-                return Some(n);
-            }
-            for child in map.values() {
-                if let Some(n) = revision_of(child) {
-                    return Some(n);
-                }
-            }
-            None
-        }
-        Value::Array(items) => items.iter().find_map(revision_of),
-        _ => None,
     }
 }
 
@@ -117,9 +110,10 @@ mod tests {
 
     use tokio::net::UnixListener;
 
-    /// Polling is off: one connection, no second request, the event arrives on that socket.
+    /// Polling is off. Two status lines are read from the socket. This stream
+    /// stamps `seq`. The fixture does not contain `revision`.
     #[tokio::test]
-    async fn subscribe_stays_open_and_yields_revision_without_polling() {
+    async fn subscribe_stays_open_and_stamps_increasing_seq_without_polling() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("herdr.sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -153,16 +147,30 @@ mod tests {
                 tokio::time::timeout(Duration::from_millis(40), reader.read_line(&mut line)).await;
             assert!(after_ack.is_err(), "client wrote again after the ack; that is a poll");
 
-            let event = json!({
+            let idle = json!({
                 "event": "pane.agent_status_changed",
                 "data": {
                     "pane_id": "w1:p1",
                     "workspace_id": "w1",
-                    "agent_status": "working",
-                    "revision": 7
+                    "agent_status": "idle"
                 }
             });
-            write.write_all(format!("{event}\n").as_bytes()).await.unwrap();
+            let working = json!({
+                "event": "pane.agent_status_changed",
+                "data": {
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "agent_status": "working"
+                }
+            });
+            assert!(idle.get("revision").is_none());
+            assert!(working.get("revision").is_none());
+            assert!(idle.pointer("/data/revision").is_none());
+            assert!(working.pointer("/data/revision").is_none());
+            write
+                .write_all(format!("{idle}\n{working}\n").as_bytes())
+                .await
+                .unwrap();
             write.flush().await.unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
@@ -174,14 +182,23 @@ mod tests {
             .unwrap();
         assert_eq!(sub.ack["via"], "socket");
         assert_eq!(sub.ack["type"], "subscription_started");
-        let event = tokio::time::timeout(Duration::from_secs(2), sub.events.next_event())
+        let first = tokio::time::timeout(Duration::from_secs(2), sub.events.next_event())
             .await
-            .expect("event timed out")
+            .expect("first event timed out")
             .unwrap();
-        assert_eq!(event["via"], "socket");
-        assert_eq!(event["event"], "pane.agent_status_changed");
-        assert_eq!(event["data"]["agent_status"], "working");
-        assert_eq!(revision_of(&event), Some(7));
+        let second = tokio::time::timeout(Duration::from_secs(2), sub.events.next_event())
+            .await
+            .expect("second event timed out")
+            .unwrap();
+        assert_eq!(first["via"], "socket");
+        assert_eq!(second["via"], "socket");
+        assert_eq!(first["data"]["agent_status"], "idle");
+        assert_eq!(second["data"]["agent_status"], "working");
+        assert!(first.pointer("/data/revision").is_none());
+        assert!(second.pointer("/data/revision").is_none());
+        let seq1 = first["seq"].as_u64().unwrap();
+        let seq2 = second["seq"].as_u64().unwrap();
+        assert!(seq1 < seq2, "seq {seq1} then {seq2} is not increasing");
         assert_eq!(accepts.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
