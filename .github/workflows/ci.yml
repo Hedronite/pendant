@@ -18,6 +18,11 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo test
         run: cargo test --workspace
+      # app/ is its own workspace, so the steps above never build it.
+      - name: cargo check (app)
+        run: cargo check --manifest-path app/Cargo.toml --all-targets --locked
+      - name: cargo test (app)
+        run: cargo test --manifest-path app/Cargo.toml --locked
 
   banned-names:
     runs-on: ubuntu-latest
