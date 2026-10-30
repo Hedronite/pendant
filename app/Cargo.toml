@@ -1,0 +1,30 @@
+[package]
+name = "pendant-app"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/Hedronite/pendant"
+description = "Pendant's phone app"
+publish = false
+
+# Until app/src/lib.rs lands, the notes store is the library root.
+[lib]
+path = "src/notes/store.rs"
+
+[dependencies]
+# Pinned to the Lapis engine merge that carries GOAL-mobile G0-G3. lapis-notes
+# is publish = false, so both stay git deps at this exact rev, never a version.
+lapis-lattice = { git = "https://github.com/Hedronite/lapis-lattice", rev = "da4d1ce815d55f89db5cbf8ec2879e14f8957add" }
+lapis-notes = { git = "https://github.com/Hedronite/lapis-lattice", rev = "da4d1ce815d55f89db5cbf8ec2879e14f8957add" }
+
+# NSURLIsExcludedFromBackupKey on the index directory (iOS, and macOS dev hosts).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSValue"] }
+
+[dev-dependencies]
+# Same major as lapis-lattice's, so it unifies: the tests read the index file.
+rusqlite = "0.40"
+
+# Its own workspace, apart from the bridge crates at the repo root.
+[workspace]
