@@ -415,6 +415,21 @@ mod tests {
     }
 
     #[test]
+    fn scratch_socket_allows_a_missing_path_and_still_rejects_dotdot() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        assert!(!missing.exists());
+        assert!(std::fs::canonicalize(&missing).is_err());
+        assert!(scratch_socket(&missing));
+
+        let walked = dir
+            .path()
+            .join(".config/herdr/sessions/g1/../../herdr.sock");
+        assert!(std::fs::canonicalize(&walked).is_err());
+        assert!(!scratch_socket(&walked));
+    }
+
+    #[test]
     fn scratch_socket_rejects_parent_dir_and_a_symlink_that_walks_out() {
         let walked = std::path::Path::new("/tmp/work/.config/herdr/sessions/g1/../../herdr.sock");
         assert!(!scratch_socket(walked));

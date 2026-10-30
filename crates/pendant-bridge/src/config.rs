@@ -33,6 +33,7 @@ impl From<BindError> for BridgeError {
         match value {
             BindError::Invalid { input, message } => BridgeError::InvalidBind { input, message },
             BindError::Unspecified { addr } => BridgeError::UnspecifiedBind(addr),
+            BindError::NonLoopback { addr } => BridgeError::NonLoopbackBind(addr),
         }
     }
 }
@@ -54,5 +55,11 @@ mod tests {
         let cfg = Config::from_raw("127.0.0.1:9000", "/tmp/custom.sock").unwrap();
         assert_eq!(cfg.bind.port(), 9000);
         assert_eq!(cfg.herdr_sock, PathBuf::from("/tmp/custom.sock"));
+    }
+
+    #[test]
+    fn non_loopback_bind_is_refused() {
+        let err = Config::from_raw("192.0.2.10:8780", "/tmp/custom.sock").unwrap_err();
+        assert!(matches!(err, BridgeError::NonLoopbackBind(_)));
     }
 }

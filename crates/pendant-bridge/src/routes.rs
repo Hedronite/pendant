@@ -574,4 +574,64 @@ mod tests {
             .insert("Origin", "http://foreign.invalid".parse().unwrap());
         assert!(tokio_tungstenite::connect_async(foreign).await.is_err());
     }
+
+    #[tokio::test]
+    async fn websocket_accepts_a_configured_serve_origin() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join(".config/herdr/herdr.sock");
+        spawn_mock(&sock, Arc::new(Mutex::new(Vec::new())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let state = AppState {
+            herdr: HerdrClient::new(&sock),
+            queue_cap: 4,
+            bind: addr,
+            serve_origin: Some("https://serve.invalid".into()),
+        };
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, crate::app(state)).await;
+        });
+
+        let mut req = format!("ws://127.0.0.1:{port}/v1/ws")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("Origin", "https://serve.invalid".parse().unwrap());
+        tokio_tungstenite::connect_async(req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_refuses_a_missing_origin() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join(".config/herdr/herdr.sock");
+        spawn_mock(&sock, Arc::new(Mutex::new(Vec::new())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let state = AppState {
+            herdr: HerdrClient::new(&sock),
+            queue_cap: 4,
+            bind: addr,
+            serve_origin: Some("https://serve.invalid".into()),
+        };
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, crate::app(state)).await;
+        });
+
+        let req = format!("ws://127.0.0.1:{port}/v1/ws")
+            .into_client_request()
+            .unwrap();
+        let err = tokio_tungstenite::connect_async(req).await.unwrap_err();
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), 403);
+            }
+            other => panic!("expected an http refusal, got {other}"),
+        }
+    }
 }

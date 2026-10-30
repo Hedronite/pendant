@@ -10,9 +10,11 @@ pub enum BindError {
     Invalid { input: String, message: String },
     #[error("refusing unspecified bind address {addr} (no 0.0.0.0 / ::)")]
     Unspecified { addr: SocketAddr },
+    #[error("refusing non-loopback bind address {addr}")]
+    NonLoopback { addr: SocketAddr },
 }
 
-/// Parse `host:port` and reject unspecified IPs (`0.0.0.0`, `::`).
+/// Parse `host:port` and accept only a loopback address.
 pub fn parse_bind(input: &str) -> Result<SocketAddr, BindError> {
     let trimmed = input.trim();
     let addr: SocketAddr = trimmed
@@ -23,6 +25,9 @@ pub fn parse_bind(input: &str) -> Result<SocketAddr, BindError> {
         })?;
     if addr.ip().is_unspecified() {
         return Err(BindError::Unspecified { addr });
+    }
+    if !addr.ip().is_loopback() {
+        return Err(BindError::NonLoopback { addr });
     }
     Ok(addr)
 }
@@ -64,5 +69,13 @@ mod tests {
             parse_bind("not-an-addr"),
             Err(BindError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn reject_non_loopback() {
+        let v4 = parse_bind("192.0.2.10:8780").unwrap_err();
+        assert!(matches!(v4, BindError::NonLoopback { .. }));
+        let v6 = parse_bind("[2001:db8::1]:8780").unwrap_err();
+        assert!(matches!(v6, BindError::NonLoopback { .. }));
     }
 }
