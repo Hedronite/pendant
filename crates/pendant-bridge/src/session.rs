@@ -133,6 +133,21 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
         let _ignored_sig = up.sig;
         match up.kind.as_str() {
             "watch" => {
+                let already = watches.contains_key(&up.pane);
+                if admit_watch(watches.len(), already, &up.pane).is_err() {
+                    let _ = tx
+                        .send(
+                            json!({
+                                "v": ENVELOPE_VERSION,
+                                "pane": up.pane,
+                                "type": "refused",
+                                "op": "watch",
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                    continue;
+                }
                 let cols = up.cols.unwrap_or(80);
                 let rows = up.rows.unwrap_or(24);
                 if let Some(prev) = watches.remove(&up.pane) {
@@ -277,8 +292,47 @@ fn scroll_text(value: &Value) -> String {
         .to_string()
 }
 
+pub const MAX_WATCHES: usize = 8;
+pub const MAX_PANE_ID: usize = 128;
+
+/// One connection may watch at most [`MAX_WATCHES`] panes. A pane id longer than
+/// [`MAX_PANE_ID`] bytes is refused. Re-watching an open pane does not count as new.
+pub fn admit_watch(open: usize, already: bool, pane: &str) -> Result<(), ()> {
+    if pane.is_empty() || pane.len() > MAX_PANE_ID || pane.starts_with('-') {
+        return Err(());
+    }
+    if !already && open >= MAX_WATCHES {
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Writes are allowed only for `…/.config/herdr/sessions/<name>/herdr.sock`.
+/// `.` and `..` components are refused, including after symlink resolution.
 pub fn scratch_socket(path: &std::path::Path) -> bool {
+    if has_dot_components(path) {
+        return false;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => socket_shape(&canonical),
+        Err(_) => socket_shape(path),
+    }
+}
+
+fn has_dot_components(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    // `Path::components` drops a `.` in the middle of an absolute path, so the
+    // raw segments are checked too.
+    let raw = path.to_str().is_none_or(|text| {
+        text.split(['/', '\\'])
+            .any(|part| part == "." || part == "..")
+    });
+    raw || path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+}
+
+fn socket_shape(path: &std::path::Path) -> bool {
     let parts: Vec<&str> = path
         .components()
         .filter_map(|c| c.as_os_str().to_str())
@@ -290,6 +344,7 @@ pub fn scratch_socket(path: &std::path::Path) -> bool {
         && parts[n - 4] == "herdr"
         && parts[n - 5] == ".config"
         && !parts[n - 2].is_empty()
+        && !has_dot_components(path)
 }
 
 pub fn approve_key(key: &str) -> bool {
@@ -360,6 +415,34 @@ mod tests {
     }
 
     #[test]
+    fn scratch_socket_rejects_parent_dir_and_a_symlink_that_walks_out() {
+        let walked = std::path::Path::new("/tmp/work/.config/herdr/sessions/g1/../../herdr.sock");
+        assert!(!scratch_socket(walked));
+        let dotted = std::path::Path::new("/tmp/work/.config/herdr/sessions/./g1/herdr.sock");
+        assert!(!scratch_socket(dotted));
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("herdr.sock"), b"").unwrap();
+        let sessions = dir.path().join(".config/herdr/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join("alias")).unwrap();
+        let linked = sessions.join("alias").join("herdr.sock");
+        assert!(!scratch_socket(&linked));
+    }
+
+    #[test]
+    fn one_connection_watches_at_most_eight_panes_and_long_ids_are_refused() {
+        assert!(admit_watch(7, false, "w1:p1").is_ok());
+        assert!(admit_watch(8, true, "w1:p1").is_ok());
+        assert!(admit_watch(8, false, "w1:p9").is_err());
+        let long = "p".repeat(129);
+        assert!(admit_watch(0, false, &long).is_err());
+        assert!(admit_watch(0, false, &"p".repeat(128)).is_ok());
+    }
+
+    #[test]
     fn approve_bar_rejects_other_keys() {
         assert!(approve_key("y"));
         assert!(approve_key("ctrl+c"));
@@ -378,7 +461,16 @@ mod dial {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, UnixListener};
-    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    fn origin_request(
+        url: &str,
+        origin: &str,
+    ) -> tokio_tungstenite::tungstenite::http::Request<()> {
+        let mut req = url.into_client_request().unwrap();
+        req.headers_mut().insert("Origin", origin.parse().unwrap());
+        req
+    }
 
     const MARKER: &str = "PENDANT-BRIDGE-G1-MARKER";
 
@@ -386,9 +478,7 @@ mod dial {
     #[tokio::test]
     async fn websocket_dials_loopback_and_speaks_the_envelope() {
         let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir
-            .path()
-            .join(".config/herdr/sessions/g1/herdr.sock");
+        let sock_path = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
         std::fs::create_dir_all(sock_path.parent().unwrap()).unwrap();
         let _ = std::fs::remove_file(&sock_path);
         let listener = UnixListener::bind(&sock_path).unwrap();
@@ -415,9 +505,7 @@ mod dial {
                     };
                     let resp = json!({"id": id, "result": result});
                     let mut stream = reader.into_inner();
-                    let _ = stream
-                        .write_all(format!("{resp}\n").as_bytes())
-                        .await;
+                    let _ = stream.write_all(format!("{resp}\n").as_bytes()).await;
                     if method == "events.subscribe" {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
@@ -435,18 +523,26 @@ mod dial {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let port = addr.port();
         let state = crate::AppState {
             herdr: HerdrClient::with_herdr_bin(&sock_path, &script),
             queue_cap: 8,
+            bind: addr,
+            serve_origin: None,
         };
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = tcp.local_addr().unwrap().port();
         tokio::spawn(async move {
             let _ = axum::serve(tcp, crate::app(state)).await;
         });
 
         let url = format!("ws://127.0.0.1:{port}/v1/ws");
-        let (mut ws, _) = connect_async(&url).await.unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(origin_request(
+            &url,
+            &format!("http://127.0.0.1:{port}"),
+        ))
+        .await
+        .unwrap();
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             r#"{"v":1,"pane":"w1:p1","type":"watch","cols":40,"rows":12}"#.into(),
         ))
@@ -479,9 +575,11 @@ mod dial {
 
         for op in ["input", "resize", "scroll"] {
             let payload = format!(r#"{{"v":1,"pane":"w1:p1","type":"{op}","sig":"ignored"}}"#);
-            ws.send(tokio_tungstenite::tungstenite::Message::Text(payload.into()))
-                .await
-                .unwrap();
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                payload.into(),
+            ))
+            .await
+            .unwrap();
             let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
                 .await
                 .unwrap()
@@ -493,7 +591,12 @@ mod dial {
         }
         drop(ws);
 
-        let (mut again, _) = connect_async(&url).await.unwrap();
+        let (mut again, _) = tokio_tungstenite::connect_async(origin_request(
+            &url,
+            &format!("http://127.0.0.1:{port}"),
+        ))
+        .await
+        .unwrap();
         again
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 r#"{"v":1,"pane":"w1:p1","type":"watch","cols":40,"rows":12}"#.into(),
@@ -514,6 +617,9 @@ mod dial {
                 break;
             }
         }
-        assert!(reconnect_full, "reconnect did not start with one full frame");
+        assert!(
+            reconnect_full,
+            "reconnect did not start with one full frame"
+        );
     }
 }

@@ -2,8 +2,10 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::header::{HOST, ORIGIN};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -29,6 +31,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/events/stream", get(events_sse))
         .route("/v1/ws", get(ws_upgrade))
         .fallback(static_files::static_handler)
+        .layer(from_fn_with_state(state.clone(), require_host))
         .with_state(state)
 }
 
@@ -91,8 +94,129 @@ async fn list_worktrees(
     }
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+async fn require_host(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok());
+    if !host_allowed(host, state.bind, state.serve_origin.as_deref()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": { "code": "host_refused", "message": "host is not allowed" }
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+async fn ws_upgrade(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok());
+    if !origin_allowed(origin, state.bind, state.serve_origin.as_deref()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": { "code": "origin_refused", "message": "origin is not allowed" }
+            })),
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| crate::session::run_socket(socket, state))
+        .into_response()
+}
+
+/// `http://127.0.0.1:{port}`, `http://localhost:{port}`, or the configured Serve origin.
+pub fn origin_allowed(
+    origin: Option<&str>,
+    bind: std::net::SocketAddr,
+    serve_origin: Option<&str>,
+) -> bool {
+    let Some(origin) = origin.and_then(parse_origin) else {
+        return false;
+    };
+    if loopback_http(&origin, bind) {
+        return true;
+    }
+    serve_origin
+        .and_then(parse_origin)
+        .is_some_and(|want| want == origin)
+}
+
+pub fn host_allowed(
+    host: Option<&str>,
+    bind: std::net::SocketAddr,
+    serve_origin: Option<&str>,
+) -> bool {
+    let Some(host) = host.map(str::trim).filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    let port = bind.port();
+    if host == format!("127.0.0.1:{port}")
+        || host == format!("localhost:{port}")
+        || host == format!("[::1]:{port}")
+    {
+        return true;
+    }
+    let Some(origin) = serve_origin.and_then(parse_origin) else {
+        return false;
+    };
+    let with_port = format!("{}:{}", origin.host, origin.port);
+    if host.eq_ignore_ascii_case(&with_port) {
+        return true;
+    }
+    host.eq_ignore_ascii_case(&origin.host) && (origin.port == 80 || origin.port == 443)
+}
+
+#[derive(PartialEq)]
+struct OriginParts {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+fn parse_origin(raw: &str) -> Option<OriginParts> {
+    let raw = raw.trim().trim_end_matches('/');
+    let (scheme, rest) = raw.split_once("://")?;
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let (host, port) = if let Some(rest) = rest.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = if after.is_empty() {
+            if scheme == "https" {
+                443
+            } else {
+                80
+            }
+        } else {
+            after.strip_prefix(':')?.parse().ok()?
+        };
+        (format!("[{}]", host.to_ascii_lowercase()), port)
+    } else if let Some((host, port)) = rest.rsplit_once(':') {
+        if host.is_empty() || port.is_empty() || host.contains(':') {
+            return None;
+        }
+        (host.to_ascii_lowercase(), port.parse().ok()?)
+    } else {
+        let port = if scheme == "https" { 443 } else { 80 };
+        (rest.to_ascii_lowercase(), port)
+    };
+    Some(OriginParts { scheme, host, port })
+}
+
+fn loopback_http(origin: &OriginParts, bind: std::net::SocketAddr) -> bool {
+    origin.scheme == "http"
+        && origin.port == bind.port()
+        && matches!(origin.host.as_str(), "127.0.0.1" | "localhost" | "[::1]")
 }
 
 fn refuse_write() -> Response {
@@ -272,9 +396,19 @@ mod tests {
     use crate::AppState;
 
     async fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
+        http_host(port, method, path, body, &format!("127.0.0.1:{port}")).await
+    }
+
+    async fn http_host(
+        port: u16,
+        method: &str,
+        path: &str,
+        body: &str,
+        host: &str,
+    ) -> (u16, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(req.as_bytes()).await.unwrap();
@@ -330,12 +464,15 @@ mod tests {
     }
 
     async fn serve_on(path: &std::path::Path) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
         let state = AppState {
             herdr: HerdrClient::new(path),
             queue_cap: 8,
+            bind: addr,
+            serve_origin: None,
         };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, crate::app(state)).await;
         });
@@ -344,7 +481,8 @@ mod tests {
 
     #[tokio::test]
     async fn gets_on_the_default_socket_still_return_data_and_posts_are_refused() {
-        let live = std::path::PathBuf::from("/tmp/pbg1-live/.config/herdr/herdr.sock");
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let live = dir.path().join(".config/herdr/herdr.sock");
         let seen = Arc::new(Mutex::new(Vec::new()));
         spawn_mock(&live, seen.clone());
         let port = serve_on(&live).await;
@@ -366,8 +504,8 @@ mod tests {
 
     #[tokio::test]
     async fn scratch_prompt_succeeds_and_a_key_outside_the_bar_is_refused() {
-        let scratch =
-            std::path::PathBuf::from("/tmp/pbg1-scratch/.config/herdr/sessions/g1/herdr.sock");
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
         let seen = Arc::new(Mutex::new(Vec::new()));
         spawn_mock(&scratch, seen.clone());
         let port = serve_on(&scratch).await;
@@ -387,5 +525,53 @@ mod tests {
         assert_eq!(status, 403);
         assert!(body.contains("key_refused"));
         assert!(!seen.lock().unwrap().iter().any(|m| m == "agent.send_keys"));
+    }
+
+    #[tokio::test]
+    async fn foreign_host_is_refused() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let live = dir.path().join(".config/herdr/herdr.sock");
+        spawn_mock(&live, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&live).await;
+        let (status, body) = http_host(port, "GET", "/v1/snapshot", "", "foreign.invalid").await;
+        assert_eq!(status, 403);
+        assert!(body.contains("host_refused"));
+        let (status, _) = http(port, "GET", "/v1/snapshot", "").await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn websocket_accepts_loopback_origin_and_rejects_a_foreign_origin() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join(".config/herdr/herdr.sock");
+        spawn_mock(&sock, Arc::new(Mutex::new(Vec::new())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let state = AppState {
+            herdr: HerdrClient::new(&sock),
+            queue_cap: 4,
+            bind: addr,
+            serve_origin: Some("https://serve.invalid".into()),
+        };
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, crate::app(state)).await;
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/v1/ws");
+        let mut ok = url.clone().into_client_request().unwrap();
+        ok.headers_mut().insert(
+            "Origin",
+            format!("http://127.0.0.1:{port}").parse().unwrap(),
+        );
+        tokio_tungstenite::connect_async(ok).await.unwrap();
+
+        let mut foreign = url.into_client_request().unwrap();
+        foreign
+            .headers_mut()
+            .insert("Origin", "http://foreign.invalid".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(foreign).await.is_err());
     }
 }
