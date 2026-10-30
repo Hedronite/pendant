@@ -12,11 +12,11 @@ You need a Rust toolchain (1.85+) and, for live data, herdr 0.9.x running on the
 cargo run -p pendant
 ```
 
-Then open [http://127.0.0.1:8787](http://127.0.0.1:8787).
+Then open [http://127.0.0.1:8780](http://127.0.0.1:8780).
 
 | Variable | Default |
 | --- | --- |
-| `PENDANT_BIND` | `127.0.0.1:8787` |
+| `PENDANT_BIND` | `127.0.0.1:8780` |
 | `PENDANT_HERDR_SOCK` | `~/.config/herdr/herdr.sock` |
 
 The process refuses unspecified bind addresses such as `0.0.0.0` or `::`.
@@ -26,7 +26,7 @@ The process refuses unspecified bind addresses such as `0.0.0.0` or `::`.
 On the machine running herdr and Pendant, publish the loopback bridge on your tailnet:
 
 ```bash
-tailscale serve --bg 8787
+tailscale serve --bg 8780
 ```
 
 Flags vary by `tailscale` version; this is a placeholder. Open the Serve HTTPS URL from a phone on the same tailnet.

@@ -4,6 +4,7 @@ mod bind;
 mod config;
 mod error;
 mod routes;
+mod session;
 mod static_files;
 
 pub use bind::{parse_bind, BindError, DEFAULT_BIND};
@@ -20,6 +21,11 @@ use tower_http::trace::TraceLayer;
 #[derive(Clone)]
 pub struct AppState {
     pub herdr: HerdrClient,
+    pub queue_cap: usize,
+    /// Loopback address this process bound. Used for Host and Origin checks.
+    pub bind: SocketAddr,
+    /// Optional Serve origin, such as `https://name.example`. Not a hard-coded name.
+    pub serve_origin: Option<String>,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -31,14 +37,20 @@ pub async fn serve(config: Config) -> Result<(), BridgeError> {
         return Err(BridgeError::UnspecifiedBind(config.bind));
     }
 
-    let state = AppState {
-        herdr: HerdrClient::new(&config.herdr_sock),
-    };
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
     if local.ip().is_unspecified() {
         return Err(BridgeError::UnspecifiedBind(local));
     }
+
+    let state = AppState {
+        herdr: HerdrClient::new(&config.herdr_sock),
+        queue_cap: 32,
+        bind: local,
+        serve_origin: std::env::var("PENDANT_SERVE_ORIGIN")
+            .ok()
+            .filter(|value| !value.is_empty()),
+    };
 
     tracing::info!(
         %local,
