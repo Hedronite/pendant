@@ -10,6 +10,9 @@ description = "Loopback HTTP bridge from Pendant to herdr"
 
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 futures-util.workspace = true
 mime_guess.workspace = true
 pendant-herdr = { path = "../pendant-herdr" }

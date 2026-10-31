@@ -23,6 +23,9 @@ jobs:
         run: cargo check --manifest-path app/Cargo.toml --all-targets --locked
       - name: cargo test (app)
         run: cargo test --manifest-path app/Cargo.toml --locked
+      - uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny check (app)
+        run: cargo deny --manifest-path app/Cargo.toml check
 
   banned-names:
     runs-on: ubuntu-latest

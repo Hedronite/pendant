@@ -99,9 +99,11 @@ struct Up {
     kind: String,
     cols: Option<u16>,
     rows: Option<u16>,
-    /// Accepted and ignored. Reserved verbs stay refused.
+    /// Accepted and ignored on reserved verbs. `attach` verifies it.
     #[serde(default)]
     sig: Option<String>,
+    #[serde(default)]
+    device_id: Option<String>,
 }
 
 pub async fn run_socket(socket: WebSocket, state: AppState) {
@@ -116,6 +118,7 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
     });
 
     let mut watches: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+    let mut attached: Option<String> = None;
     let fulls: std::sync::Arc<std::sync::Mutex<HashMap<String, WireFrame>>> =
         std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -130,7 +133,6 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
         if up.v != ENVELOPE_VERSION {
             continue;
         }
-        let _ignored_sig = up.sig;
         match up.kind.as_str() {
             "watch" => {
                 let already = watches.contains_key(&up.pane);
@@ -175,6 +177,13 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
                     let _ = tx.send(frame_json(&up.pane, &full)).await;
                 }
             }
+            "attach" => {
+                if let Some(id) = up.device_id.clone() {
+                    if state.pairing.attach(&id, up.sig.as_deref()) {
+                        attached = Some(id);
+                    }
+                }
+            }
             "input" | "resize" | "scroll" => {
                 let _ = tx
                     .send(
@@ -193,6 +202,9 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
     }
     for handle in watches.into_values() {
         handle.abort();
+    }
+    if let Some(device) = attached {
+        state.pairing.release(&device);
     }
     writer.abort();
 }
@@ -415,6 +427,21 @@ mod tests {
     }
 
     #[test]
+    fn scratch_socket_allows_a_missing_path_and_still_rejects_dotdot() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        assert!(!missing.exists());
+        assert!(std::fs::canonicalize(&missing).is_err());
+        assert!(scratch_socket(&missing));
+
+        let walked = dir
+            .path()
+            .join(".config/herdr/sessions/g1/../../herdr.sock");
+        assert!(std::fs::canonicalize(&walked).is_err());
+        assert!(!scratch_socket(&walked));
+    }
+
+    #[test]
     fn scratch_socket_rejects_parent_dir_and_a_symlink_that_walks_out() {
         let walked = std::path::Path::new("/tmp/work/.config/herdr/sessions/g1/../../herdr.sock");
         assert!(!scratch_socket(walked));
@@ -531,6 +558,7 @@ mod dial {
             queue_cap: 8,
             bind: addr,
             serve_origin: None,
+            pairing: crate::pairing::Pairing::new(),
         };
         tokio::spawn(async move {
             let _ = axum::serve(tcp, crate::app(state)).await;

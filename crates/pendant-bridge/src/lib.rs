@@ -1,8 +1,9 @@
-//! Loopback HTTP bridge. Never bind `0.0.0.0` / `::`.
+//! Loopback HTTP bridge. Never bind a non-loopback address.
 
 mod bind;
 mod config;
 mod error;
+mod pairing;
 mod routes;
 mod session;
 mod static_files;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub bind: SocketAddr,
     /// Optional Serve origin, such as `https://name.example`. Not a hard-coded name.
     pub serve_origin: Option<String>,
+    pub pairing: pairing::Pairing,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -33,15 +35,11 @@ pub fn app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: Config) -> Result<(), BridgeError> {
-    if config.bind.ip().is_unspecified() {
-        return Err(BridgeError::UnspecifiedBind(config.bind));
-    }
+    assert_loopback_only(config.bind)?;
 
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
-    if local.ip().is_unspecified() {
-        return Err(BridgeError::UnspecifiedBind(local));
-    }
+    assert_loopback_only(local)?;
 
     let state = AppState {
         herdr: HerdrClient::new(&config.herdr_sock),
@@ -50,6 +48,7 @@ pub async fn serve(config: Config) -> Result<(), BridgeError> {
         serve_origin: std::env::var("PENDANT_SERVE_ORIGIN")
             .ok()
             .filter(|value| !value.is_empty()),
+        pairing: pairing::Pairing::new(),
     };
 
     tracing::info!(
@@ -72,6 +71,8 @@ async fn shutdown_signal() {
 pub fn assert_loopback_only(addr: SocketAddr) -> Result<(), BridgeError> {
     if addr.ip().is_unspecified() {
         Err(BridgeError::UnspecifiedBind(addr))
+    } else if !addr.ip().is_loopback() {
+        Err(BridgeError::NonLoopbackBind(addr))
     } else {
         Ok(())
     }
