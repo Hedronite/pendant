@@ -8,6 +8,8 @@ pub enum BridgeError {
     InvalidBind { input: String, message: String },
     #[error("refusing unspecified bind address {0} (no 0.0.0.0 / ::)")]
     UnspecifiedBind(SocketAddr),
+    #[error("refusing non-loopback bind address {0}")]
+    NonLoopbackBind(SocketAddr),
     #[error("listen failed: {0}")]
     Listen(#[from] std::io::Error),
 }

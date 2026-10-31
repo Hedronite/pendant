@@ -19,17 +19,17 @@ Then open [http://127.0.0.1:8780](http://127.0.0.1:8780).
 | `PENDANT_BIND` | `127.0.0.1:8780` |
 | `PENDANT_HERDR_SOCK` | `~/.config/herdr/herdr.sock` |
 
-The process refuses unspecified bind addresses such as `0.0.0.0` or `::`.
+The process refuses `PENDANT_BIND` unless the address is loopback. `0.0.0.0`, `::`, and any other non-loopback address are refused.
 
 ## Phone access (Tailscale Serve)
 
 On the machine running herdr and Pendant, publish the loopback bridge on your tailnet:
 
 ```bash
-tailscale serve --bg 8780
+tailscale serve --bg --https=8443 http://127.0.0.1:8780
 ```
 
-Flags vary by `tailscale` version; this is a placeholder. Open the Serve HTTPS URL from a phone on the same tailnet.
+Pendant HTTPS is port `8443`, proxying `http://127.0.0.1:8780`. Port `443` is not the Pendant route. Set `PENDANT_SERVE_ORIGIN` to the exact origin a browser sends on that route. Leaving it unset makes those requests `403`.
 
 ## Security
 

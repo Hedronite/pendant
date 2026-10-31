@@ -15,7 +15,8 @@ use pendant_herdr::{CreateWorktree, HerdrError};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::session::{approve_key, scratch_socket};
+use crate::pairing::{self, unpaired_log, AuthError};
+use crate::session::{approve_key, canonical_scratch};
 use crate::static_files;
 use crate::AppState;
 
@@ -27,6 +28,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/agents/{id}", get(agent_detail))
         .route("/v1/agents/{id}/prompt", post(agent_prompt))
         .route("/v1/agents/{id}/keys", post(agent_keys))
+        .route("/v1/agents/{id}/approve", post(agent_approve))
+        .route("/v1/pair/qr", get(pair_qr))
+        .route("/v1/challenge", get(issue_challenge))
+        .route("/v1/pair", post(pair_device))
+        .route("/v1/grant", post(open_grant))
+        .route("/v1/devices/{id}/revoke", post(revoke_device))
+        .route("/v1/host/revoke", post(host_revoke))
         .route("/v1/events", get(events_inbox))
         .route("/v1/events/stream", get(events_sse))
         .route("/v1/ws", get(ws_upgrade))
@@ -234,12 +242,18 @@ fn refuse_write() -> Response {
 
 async fn create_worktree(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateWorktree>,
 ) -> Response {
-    if !scratch_socket(state.herdr.socket_path()) {
+    let Some(herdr) = scratch_client(&state) else {
         return refuse_write();
+    };
+    let canonical = serde_json::to_string(&body).unwrap_or_default();
+    let message = signed_message(&headers, "POST", "/v1/worktrees", &canonical);
+    if let Err(response) = gate_write(&state, &headers, &message) {
+        return response;
     }
-    match state.herdr.worktree_create(&body).await {
+    match herdr.worktree_create(&body).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),
     }
@@ -274,11 +288,12 @@ async fn agent_detail(State(state): State<AppState>, Path(id): Path<String>) -> 
 async fn agent_prompt(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<PromptBody>,
 ) -> Response {
-    if !scratch_socket(state.herdr.socket_path()) {
+    let Some(herdr) = scratch_client(&state) else {
         return refuse_write();
-    }
+    };
     if body.prompt.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -286,7 +301,12 @@ async fn agent_prompt(
         )
             .into_response();
     }
-    match state.herdr.agent_prompt(&id, &body.prompt).await {
+    let path = format!("/v1/agents/{id}/prompt");
+    let message = signed_message(&headers, "POST", &path, body.prompt.trim());
+    if let Err(response) = gate_write(&state, &headers, &message) {
+        return response;
+    }
+    match herdr.agent_prompt(&id, &body.prompt).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),
     }
@@ -295,17 +315,24 @@ async fn agent_prompt(
 async fn agent_keys(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<KeysBody>,
 ) -> Response {
-    if !scratch_socket(state.herdr.socket_path()) {
+    let Some(herdr) = scratch_client(&state) else {
         return refuse_write();
-    }
+    };
     if body.keys.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":{"code":"empty_keys","message":"keys must not be empty"}})),
         )
             .into_response();
+    }
+    let path = format!("/v1/agents/{id}/keys");
+    let canonical = body.keys.join("\n");
+    let message = signed_message(&headers, "POST", &path, &canonical);
+    if let Err(response) = gate_write(&state, &headers, &message) {
+        return response;
     }
     if body.keys.iter().any(|key| !approve_key(key)) {
         return (
@@ -319,10 +346,255 @@ async fn agent_keys(
         )
             .into_response();
     }
-    match state.herdr.agent_send_keys(&id, &body.keys).await {
+    match herdr.agent_send_keys(&id, &body.keys).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),
     }
+}
+
+#[derive(Deserialize)]
+struct ApproveBody {
+    decision: String,
+}
+
+async fn agent_approve(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ApproveBody>,
+) -> Response {
+    let Some(herdr) = scratch_client(&state) else {
+        return refuse_write();
+    };
+    let path = format!("/v1/agents/{id}/approve");
+    let message = signed_message(&headers, "POST", &path, body.decision.trim());
+    if let Err(response) = gate_write(&state, &headers, &message) {
+        return response;
+    }
+    let decision = body.decision.trim().to_string();
+    if !approve_key(&decision) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": { "code": "key_refused", "message": "key is outside the approve bar" }
+            })),
+        )
+            .into_response();
+    }
+    match herdr.agent_send_keys(&id, &[decision]).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => herdr_error(err),
+    }
+}
+
+async fn pair_qr(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = local_only(&state, &headers) {
+        return response;
+    }
+    let nonce = state.pairing.issue_nonce();
+    Json(json!({
+        "v": 1,
+        "nonce": nonce,
+        "payload": pairing::Pairing::qr_payload(&nonce),
+        "algorithm": pairing::DEVICE_SIGNATURE,
+    }))
+    .into_response()
+}
+
+async fn issue_challenge(State(state): State<AppState>) -> Response {
+    match state.pairing.issue_challenge() {
+        Ok(challenge) => Json(json!({ "challenge": challenge })).into_response(),
+        Err(AuthError::RateLimited) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": {"code": "rate_limited", "message": "too many challenges"}})),
+        )
+            .into_response(),
+        Err(err) => auth_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct PairBody {
+    device_id: String,
+    public_key: String,
+    nonce: String,
+    sig: String,
+    #[serde(default)]
+    takeover: bool,
+}
+
+async fn pair_device(State(state): State<AppState>, Json(body): Json<PairBody>) -> Response {
+    match state.pairing.pair(
+        &body.device_id,
+        &body.public_key,
+        &body.nonce,
+        &body.sig,
+        body.takeover,
+    ) {
+        Ok(()) => Json(json!({"ok": true, "takeover": pairing::TAKEOVER})).into_response(),
+        Err(err) => auth_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct GrantBody {
+    device_id: String,
+    sig: String,
+    challenge: String,
+}
+
+async fn open_grant(State(state): State<AppState>, Json(body): Json<GrantBody>) -> Response {
+    match state
+        .pairing
+        .open_grant(&body.device_id, &body.sig, &body.challenge)
+    {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(err) => auth_error(err),
+    }
+}
+
+async fn revoke_device(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = local_only(&state, &headers) {
+        return response;
+    }
+    let Some(signer) = header_value(&headers, "x-pendant-device") else {
+        return auth_error(AuthError::BadSignature);
+    };
+    let Some(sig) = header_value(&headers, "x-pendant-signature") else {
+        return auth_error(AuthError::BadSignature);
+    };
+    let Some(challenge) = header_value(&headers, "x-pendant-challenge") else {
+        return auth_error(AuthError::BadSignature);
+    };
+    match state.pairing.revoke(&id, signer, sig, challenge) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "revoked": id,
+            "real_pairings": state.pairing.real_pairings(),
+        }))
+        .into_response(),
+        Err(err) => auth_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct HostRevokeBody {
+    device_id: String,
+}
+
+async fn host_revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HostRevokeBody>,
+) -> Response {
+    if let Err(response) = local_only(&state, &headers) {
+        return response;
+    }
+    state.pairing.host_revoke(&body.device_id);
+    Json(json!({
+        "ok": true,
+        "revoked": body.device_id,
+        "real_pairings": state.pairing.real_pairings(),
+    }))
+    .into_response()
+}
+
+fn signed_message(headers: &HeaderMap, method: &str, path: &str, canonical: &str) -> Vec<u8> {
+    let device = header_value(headers, "x-pendant-device").unwrap_or("");
+    let challenge = header_value(headers, "x-pendant-challenge").unwrap_or("");
+    pairing::sign_message(device, method, path, challenge, canonical)
+}
+
+fn gate_write(state: &AppState, headers: &HeaderMap, message: &[u8]) -> Result<(), Response> {
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    let device = header_value(headers, "x-pendant-device");
+    let sig = header_value(headers, "x-pendant-signature");
+    let challenge = header_value(headers, "x-pendant-challenge").unwrap_or("");
+    if via_serve(host, state.serve_origin.as_deref())
+        && !device.is_some_and(|id| state.pairing.is_paired(id))
+    {
+        let line = unpaired_log(host.unwrap_or("serve"));
+        tracing::warn!("{line}");
+        return Err(forbid("unpaired", &line));
+    }
+    let (Some(device), Some(sig)) = (device, sig) else {
+        return Err(forbid(
+            "bad_signature",
+            "device signature is missing or wrong",
+        ));
+    };
+    match state.pairing.authorize(device, message, sig, challenge) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(auth_error(err)),
+    }
+}
+
+fn via_serve(host: Option<&str>, serve_origin: Option<&str>) -> bool {
+    let Some(host) = host.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]") {
+        return false;
+    }
+    let Some(origin) = serve_origin.and_then(parse_origin) else {
+        return false;
+    };
+    let with_port = format!("{}:{}", origin.host, origin.port);
+    host.eq_ignore_ascii_case(&with_port)
+        || (host.eq_ignore_ascii_case(&origin.host) && (origin.port == 80 || origin.port == 443))
+}
+
+fn proxy_forwarded(headers: &HeaderMap) -> bool {
+    headers.get("forwarded").is_some() || headers.get("x-forwarded-for").is_some()
+}
+
+fn local_only(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    // A loopback Host is not enough: the proxy dials 127.0.0.1 and can forward that Host.
+    // Forwarding headers are client-visible proof the request was proxied. The TCP peer is not.
+    if proxy_forwarded(headers) || via_serve(host, state.serve_origin.as_deref()) {
+        Err(forbid("local_only", "this route is only on the host"))
+    } else {
+        Ok(())
+    }
+}
+
+fn scratch_client(state: &AppState) -> Option<pendant_herdr::HerdrClient> {
+    let path = canonical_scratch(state.herdr.socket_path())?;
+    Some(state.herdr.with_socket_path(path))
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn forbid(code: &str, message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": {"code": code, "message": message}})),
+    )
+        .into_response()
+}
+
+fn auth_error(err: AuthError) -> Response {
+    let (code, message) = match err {
+        AuthError::BadSignature => ("bad_signature", "device signature is missing or wrong"),
+        AuthError::GrantRequired => ("grant_required", "biometric grant is not open"),
+        AuthError::GrantReleased => ("grant_released", "biometric grant released"),
+        AuthError::Revoked => ("revoked", "device is revoked"),
+        AuthError::TakeoverOff => ("takeover_off", "takeover is off"),
+        AuthError::Unpaired => ("unpaired", "unpaired device"),
+        AuthError::RateLimited => ("rate_limited", "too many challenges"),
+    };
+    forbid(code, message)
 }
 
 async fn events_inbox(State(state): State<AppState>) -> Response {
@@ -393,7 +665,10 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream, UnixListener};
 
+    use crate::pairing;
     use crate::AppState;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     async fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
         http_host(port, method, path, body, &format!("127.0.0.1:{port}")).await
@@ -406,9 +681,27 @@ mod tests {
         body: &str,
         host: &str,
     ) -> (u16, String) {
+        http_headers(port, method, path, body, host, &[]).await
+    }
+
+    async fn http_headers(
+        port: u16,
+        method: &str,
+        path: &str,
+        body: &str,
+        host: &str,
+        extra: &[(&str, &str)],
+    ) -> (u16, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut headers = String::new();
+        for (name, value) in extra {
+            headers.push_str(name);
+            headers.push_str(": ");
+            headers.push_str(value);
+            headers.push_str("\r\n");
+        }
         let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(req.as_bytes()).await.unwrap();
@@ -417,6 +710,87 @@ mod tests {
         let text = String::from_utf8_lossy(&buf).to_string();
         let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
         (status, text)
+    }
+
+    fn response_json(raw: &str) -> serde_json::Value {
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        serde_json::from_str(body).unwrap_or(serde_json::json!({}))
+    }
+
+    async fn pair_only(port: u16) -> pairing::TestDevice {
+        let (status, raw) = http(port, "GET", "/v1/pair/qr", "").await;
+        assert_eq!(status, 200);
+        let qr = response_json(&raw);
+        let nonce = qr["nonce"].as_str().unwrap();
+        assert!(qr["payload"]
+            .as_str()
+            .unwrap()
+            .starts_with("pendant-pair:v1:"));
+        assert!(!raw.contains("private_key"));
+        let phone = pairing::TestDevice::generate("phone-1");
+        let public = phone.public_b64();
+        let sig = phone.sign_b64(&pairing::pair_message(&phone.id, &public, nonce));
+        let pair_body = serde_json::json!({
+            "device_id": phone.id,
+            "public_key": public,
+            "nonce": nonce,
+            "sig": sig,
+        })
+        .to_string();
+        let (status, _) = http(port, "POST", "/v1/pair", &pair_body).await;
+        assert_eq!(status, 200);
+        phone
+    }
+
+    async fn fresh_challenge(port: u16) -> String {
+        let (status, raw) = http(port, "GET", "/v1/challenge", "").await;
+        assert_eq!(status, 200);
+        response_json(&raw)["challenge"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn enroll(port: u16) -> pairing::TestDevice {
+        let phone = pair_only(port).await;
+        let challenge = fresh_challenge(port).await;
+        let grant_sig = phone.sign_b64(&pairing::grant_message(&phone.id, &challenge));
+        let grant_body = serde_json::json!({
+            "device_id": phone.id,
+            "sig": grant_sig,
+            "challenge": challenge,
+        })
+        .to_string();
+        let (status, _) = http(port, "POST", "/v1/grant", &grant_body).await;
+        assert_eq!(status, 200);
+        phone
+    }
+
+    async fn signed(
+        port: u16,
+        phone: &pairing::TestDevice,
+        method: &str,
+        path: &str,
+        canonical: &str,
+        body: &str,
+    ) -> (u16, String) {
+        let challenge = fresh_challenge(port).await;
+        let sig = phone.sign_b64(&pairing::sign_message(
+            &phone.id, method, path, &challenge, canonical,
+        ));
+        http_headers(
+            port,
+            method,
+            path,
+            body,
+            &format!("127.0.0.1:{port}"),
+            &[
+                ("x-pendant-device", phone.id.as_str()),
+                ("x-pendant-signature", sig.as_str()),
+                ("x-pendant-challenge", challenge.as_str()),
+            ],
+        )
+        .await
     }
 
     fn spawn_mock(path: &std::path::Path, seen: Arc<Mutex<Vec<String>>>) {
@@ -466,13 +840,35 @@ mod tests {
     async fn serve_on(path: &std::path::Path) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let port = addr.port();
         let state = AppState {
             herdr: HerdrClient::new(path),
             queue_cap: 8,
             bind: addr,
             serve_origin: None,
+            pairing: pairing::Pairing::new(),
         };
+        serve_state(listener, state).await
+    }
+
+    async fn serve_with(
+        path: &std::path::Path,
+        pairing: pairing::Pairing,
+        serve_origin: Option<String>,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = AppState {
+            herdr: HerdrClient::new(path),
+            queue_cap: 8,
+            bind: addr,
+            serve_origin,
+            pairing,
+        };
+        serve_state(listener, state).await
+    }
+
+    async fn serve_state(listener: TcpListener, state: AppState) -> u16 {
+        let port = state.bind.port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, crate::app(state)).await;
         });
@@ -509,19 +905,39 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         spawn_mock(&scratch, seen.clone());
         let port = serve_on(&scratch).await;
-        let (status, _) = http(
+        let phone = enroll(port).await;
+        let (status, _) = signed(
             port,
+            &phone,
             "POST",
             "/v1/agents/w1:p1/prompt",
+            "hello",
             r#"{"prompt":"hello"}"#,
         )
         .await;
         assert_eq!(status, 200);
         assert!(seen.lock().unwrap().iter().any(|m| m == "agent.prompt"));
-        let (status, _) = http(port, "POST", "/v1/worktrees", "{}").await;
+        let tree: pendant_herdr::CreateWorktree = serde_json::from_str("{}").unwrap();
+        let tree_body = serde_json::to_string(&tree).unwrap();
+        let (status, _) = signed(
+            port,
+            &phone,
+            "POST",
+            "/v1/worktrees",
+            &tree_body,
+            &tree_body,
+        )
+        .await;
         assert_eq!(status, 200);
-        let (status, body) =
-            http(port, "POST", "/v1/agents/w1:p1/keys", r#"{"keys":["rm"]}"#).await;
+        let (status, body) = signed(
+            port,
+            &phone,
+            "POST",
+            "/v1/agents/w1:p1/keys",
+            "rm",
+            r#"{"keys":["rm"]}"#,
+        )
+        .await;
         assert_eq!(status, 403);
         assert!(body.contains("key_refused"));
         assert!(!seen.lock().unwrap().iter().any(|m| m == "agent.send_keys"));
@@ -555,6 +971,7 @@ mod tests {
             queue_cap: 4,
             bind: addr,
             serve_origin: Some("https://serve.invalid".into()),
+            pairing: pairing::Pairing::new(),
         };
         tokio::spawn(async move {
             let _ = axum::serve(listener, crate::app(state)).await;
@@ -573,5 +990,470 @@ mod tests {
             .headers_mut()
             .insert("Origin", "http://foreign.invalid".parse().unwrap());
         assert!(tokio_tungstenite::connect_async(foreign).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn websocket_accepts_configured_serve_origin() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("PENDANT_SERVE_ORIGIN", "https://serve.invalid");
+        let origin = std::env::var("PENDANT_SERVE_ORIGIN").unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join(".config/herdr/herdr.sock");
+        spawn_mock(&sock, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_with(&sock, pairing::Pairing::new(), Some(origin.clone())).await;
+        let mut req = format!("ws://127.0.0.1:{port}/v1/ws")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert("Origin", origin.parse().unwrap());
+        tokio_tungstenite::connect_async(req).await.unwrap();
+        std::env::remove_var("PENDANT_SERVE_ORIGIN");
+    }
+
+    #[tokio::test]
+    async fn websocket_refuses_a_missing_origin() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let sock = dir.path().join(".config/herdr/herdr.sock");
+        spawn_mock(&sock, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&sock).await;
+        let req = format!("ws://127.0.0.1:{port}/v1/ws")
+            .into_client_request()
+            .unwrap();
+        let err = tokio_tungstenite::connect_async(req).await.unwrap_err();
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), 403);
+            }
+            other => panic!("expected an http refusal, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unpaired_device_is_refused_through_serve() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_with(
+            &scratch,
+            pairing::Pairing::new(),
+            Some("https://serve.invalid".into()),
+        )
+        .await;
+        let (status, body) = http_headers(
+            port,
+            "POST",
+            "/v1/agents/w1:p1/prompt",
+            r#"{"prompt":"hello"}"#,
+            "serve.invalid",
+            &[("x-pendant-device", "phone-x")],
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(body.contains("unpaired device refused via=serve host=serve.invalid"));
+        let line = body
+            .lines()
+            .find(|line| line.contains("unpaired device refused"))
+            .unwrap();
+        assert!(!line.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn write_routes_refuse_a_missing_or_wrong_signature() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&scratch).await;
+        let tree: pendant_herdr::CreateWorktree = serde_json::from_str("{}").unwrap();
+        let tree_body = serde_json::to_string(&tree).unwrap();
+        let calls = [
+            ("/v1/agents/w1:p1/prompt", "hello", r#"{"prompt":"hello"}"#),
+            ("/v1/agents/w1:p1/keys", "y", r#"{"keys":["y"]}"#),
+            ("/v1/agents/w1:p1/approve", "y", r#"{"decision":"y"}"#),
+            ("/v1/worktrees", tree_body.as_str(), tree_body.as_str()),
+        ];
+        for (path, canonical, body) in calls {
+            let (status, raw) = http(port, "POST", path, body).await;
+            assert_eq!(status, 403, "{path}");
+            assert!(raw.contains("bad_signature"), "{path}");
+            let phone = pairing::TestDevice::generate("phone-1");
+            let sig = phone.sign_b64(b"wrong");
+            let (status, raw) = http_headers(
+                port,
+                "POST",
+                path,
+                body,
+                &format!("127.0.0.1:{port}"),
+                &[
+                    ("x-pendant-device", "phone-1"),
+                    ("x-pendant-signature", sig.as_str()),
+                ],
+            )
+            .await;
+            assert_eq!(status, 403, "{path} {canonical}");
+            assert!(raw.contains("bad_signature"), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_routes_refuse_a_signature_without_a_grant() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&scratch).await;
+        let phone = pair_only(port).await;
+        let tree: pendant_herdr::CreateWorktree = serde_json::from_str("{}").unwrap();
+        let tree_body = serde_json::to_string(&tree).unwrap();
+        let calls = [
+            ("/v1/agents/w1:p1/prompt", "hello", r#"{"prompt":"hello"}"#),
+            ("/v1/agents/w1:p1/keys", "y", r#"{"keys":["y"]}"#),
+            ("/v1/agents/w1:p1/approve", "y", r#"{"decision":"y"}"#),
+            ("/v1/worktrees", tree_body.as_str(), tree_body.as_str()),
+        ];
+        for (path, canonical, body) in calls {
+            let (status, raw) = signed(port, &phone, "POST", path, canonical, body).await;
+            assert_eq!(status, 403, "{path}");
+            assert!(raw.contains("grant_required"), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_releases_on_timeout() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_with(
+            &scratch,
+            pairing::Pairing::with_ttl(std::time::Duration::from_millis(30)),
+            None,
+        )
+        .await;
+        let phone = enroll(port).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (status, raw) = signed(
+            port,
+            &phone,
+            "POST",
+            "/v1/agents/w1:p1/prompt",
+            "hello",
+            r#"{"prompt":"hello"}"#,
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("grant_released"));
+    }
+
+    #[tokio::test]
+    async fn grant_releases_when_the_connection_drops() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&scratch).await;
+        let phone = enroll(port).await;
+        let mut req = format!("ws://127.0.0.1:{port}/v1/ws")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "Origin",
+            format!("http://127.0.0.1:{port}").parse().unwrap(),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let challenge = fresh_challenge(port).await;
+        let sig = phone.sign_b64(&pairing::attach_message(&phone.id, &challenge));
+        let attach = serde_json::json!({
+            "v": 1,
+            "pane": "w1:p1",
+            "type": "attach",
+            "device_id": phone.id,
+            "sig": sig,
+            "challenge": challenge,
+        })
+        .to_string();
+        use futures_util::SinkExt;
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(attach.into()))
+            .await
+            .unwrap();
+        drop(ws);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (status, raw) = signed(
+            port,
+            &phone,
+            "POST",
+            "/v1/agents/w1:p1/prompt",
+            "hello",
+            r#"{"prompt":"hello"}"#,
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("grant_released"));
+    }
+
+    #[tokio::test]
+    async fn takeover_stays_off() {
+        assert!(!pairing::TAKEOVER);
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&scratch).await;
+        let _first = pair_only(port).await;
+        let (status, raw) = http(port, "GET", "/v1/pair/qr", "").await;
+        assert_eq!(status, 200);
+        let nonce = response_json(&raw)["nonce"].as_str().unwrap().to_string();
+        let other = pairing::TestDevice::generate("phone-2");
+        let public = other.public_b64();
+        let sig = other.sign_b64(&pairing::pair_message(&other.id, &public, &nonce));
+        let body = serde_json::json!({
+            "device_id": other.id,
+            "public_key": public,
+            "nonce": nonce,
+            "sig": sig,
+            "takeover": true,
+        })
+        .to_string();
+        let (status, raw) = http(port, "POST", "/v1/pair", &body).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("takeover_off"));
+    }
+
+    #[tokio::test]
+    async fn lost_phone_revoke_is_refused_before_any_real_pairing() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&scratch).await;
+        let phone = pair_only(port).await;
+        let challenge = fresh_challenge(port).await;
+        let sig = phone.sign_b64(&pairing::revoke_message(&phone.id, &challenge));
+        let (status, raw) = http_headers(
+            port,
+            "POST",
+            &format!("/v1/devices/{}/revoke", phone.id),
+            "",
+            &format!("127.0.0.1:{port}"),
+            &[
+                ("x-pendant-device", phone.id.as_str()),
+                ("x-pendant-signature", sig.as_str()),
+                ("x-pendant-challenge", challenge.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200);
+        let body = response_json(&raw);
+        assert_eq!(body["real_pairings"], 0);
+        let grant_challenge = fresh_challenge(port).await;
+        let grant_sig = phone.sign_b64(&pairing::grant_message(&phone.id, &grant_challenge));
+        let grant_body = serde_json::json!({
+            "device_id": phone.id,
+            "sig": grant_sig,
+            "challenge": grant_challenge,
+        })
+        .to_string();
+        let (status, raw) = http(port, "POST", "/v1/grant", &grant_body).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("revoked"));
+    }
+
+    #[tokio::test]
+    async fn qr_and_revoke_are_local_only_and_a_revoked_id_stays_tombstoned() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_with(
+            &scratch,
+            pairing::Pairing::new(),
+            Some("https://serve.invalid".into()),
+        )
+        .await;
+        let (status, raw) = http_host(port, "GET", "/v1/pair/qr", "", "serve.invalid").await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("local_only"));
+        let phone = pair_only(port).await;
+        let challenge = fresh_challenge(port).await;
+        let sig = phone.sign_b64(&pairing::revoke_message(&phone.id, &challenge));
+        let (status, raw) = http_headers(
+            port,
+            "POST",
+            &format!("/v1/devices/{}/revoke", phone.id),
+            "",
+            "serve.invalid",
+            &[
+                ("x-pendant-device", phone.id.as_str()),
+                ("x-pendant-signature", sig.as_str()),
+                ("x-pendant-challenge", challenge.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("local_only"));
+        let (status, raw) = http(port, "GET", "/v1/pair/qr", "").await;
+        assert_eq!(status, 200);
+        let nonce = response_json(&raw)["nonce"].as_str().unwrap().to_string();
+        let only_nonce = phone.sign_b64(format!("pendant-pair:v1:{nonce}").as_bytes());
+        let public = phone.public_b64();
+        let weak = serde_json::json!({
+            "device_id": "phone-2",
+            "public_key": public,
+            "nonce": nonce,
+            "sig": only_nonce,
+        })
+        .to_string();
+        let (status, raw) = http(port, "POST", "/v1/pair", &weak).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("bad_signature"));
+        let local_challenge = fresh_challenge(port).await;
+        let local_sig = phone.sign_b64(&pairing::revoke_message(&phone.id, &local_challenge));
+        let (status, _) = http_headers(
+            port,
+            "POST",
+            &format!("/v1/devices/{}/revoke", phone.id),
+            "",
+            &format!("127.0.0.1:{port}"),
+            &[
+                ("x-pendant-device", phone.id.as_str()),
+                ("x-pendant-signature", local_sig.as_str()),
+                ("x-pendant-challenge", local_challenge.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, raw) = http(port, "GET", "/v1/pair/qr", "").await;
+        assert_eq!(status, 200);
+        let nonce = response_json(&raw)["nonce"].as_str().unwrap().to_string();
+        let again = phone.sign_b64(&pairing::pair_message(&phone.id, &public, &nonce));
+        let body = serde_json::json!({
+            "device_id": phone.id,
+            "public_key": public,
+            "nonce": nonce,
+            "sig": again,
+        })
+        .to_string();
+        let (status, raw) = http(port, "POST", "/v1/pair", &body).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("revoked"));
+    }
+
+    #[tokio::test]
+    async fn loopback_host_with_forwarding_headers_gets_no_pairing_nonce() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&scratch).await;
+        let host = format!("127.0.0.1:{port}");
+        for extra in [
+            ("x-forwarded-for", "203.0.113.5"),
+            ("forwarded", "for=203.0.113.5"),
+        ] {
+            let (status, raw) = http_headers(port, "GET", "/v1/pair/qr", "", &host, &[extra]).await;
+            assert_eq!(status, 403);
+            assert!(raw.contains("local_only"));
+            assert!(!raw.contains("pendant-pair:v1:"));
+            let phone = pairing::TestDevice::generate("phone-x");
+            let public = phone.public_b64();
+            let nonce = "0123456789abcdef0123456789abcdef";
+            let sig = phone.sign_b64(&pairing::pair_message(&phone.id, &public, nonce));
+            let body = serde_json::json!({
+                "device_id": phone.id,
+                "public_key": public,
+                "nonce": nonce,
+                "sig": sig,
+            })
+            .to_string();
+            let (status, raw) = http(port, "POST", "/v1/pair", &body).await;
+            assert_eq!(status, 403);
+            assert!(raw.contains("bad_signature"));
+        }
+        let (status, raw) = http(port, "GET", "/v1/pair/qr", "").await;
+        assert_eq!(status, 200);
+        assert!(raw.contains("pendant-pair:v1:"));
+    }
+
+    #[tokio::test]
+    async fn host_revoke_is_refused_to_a_serve_caller() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_with(
+            &scratch,
+            pairing::Pairing::new(),
+            Some("https://serve.invalid".into()),
+        )
+        .await;
+        let phone = pair_only(port).await;
+        let body = serde_json::json!({"device_id": phone.id}).to_string();
+        let (status, raw) = http_headers(
+            port,
+            "POST",
+            "/v1/host/revoke",
+            &body,
+            "serve.invalid",
+            &[("x-forwarded-for", "203.0.113.5")],
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("local_only"));
+        let (status, raw) = http_headers(
+            port,
+            "POST",
+            "/v1/host/revoke",
+            &body,
+            &format!("127.0.0.1:{port}"),
+            &[("forwarded", "for=203.0.113.5")],
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("local_only"));
+        let (status, raw) = http(port, "POST", "/v1/host/revoke", &body).await;
+        assert_eq!(status, 200);
+        assert_eq!(response_json(&raw)["real_pairings"], 0);
+        let grant_challenge = fresh_challenge(port).await;
+        let grant_sig = phone.sign_b64(&pairing::grant_message(&phone.id, &grant_challenge));
+        let grant_body = serde_json::json!({
+            "device_id": phone.id,
+            "sig": grant_sig,
+            "challenge": grant_challenge,
+        })
+        .to_string();
+        let (status, raw) = http(port, "POST", "/v1/grant", &grant_body).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("revoked"));
+    }
+
+    #[tokio::test]
+    async fn challenge_is_rate_limited_and_expires() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let limited = serve_with(
+            &scratch,
+            pairing::Pairing::with_challenge_limit(2, std::time::Duration::from_secs(30)),
+            None,
+        )
+        .await;
+        assert_eq!(http(limited, "GET", "/v1/challenge", "").await.0, 200);
+        assert_eq!(http(limited, "GET", "/v1/challenge", "").await.0, 200);
+        let (status, raw) = http(limited, "GET", "/v1/challenge", "").await;
+        assert_eq!(status, 429);
+        assert!(raw.contains("rate_limited"));
+
+        let expiring = serve_with(
+            &scratch,
+            pairing::Pairing::with_challenge_limit(8, std::time::Duration::from_millis(30)),
+            None,
+        )
+        .await;
+        let phone = pair_only(expiring).await;
+        let stale = fresh_challenge(expiring).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let grant_sig = phone.sign_b64(&pairing::grant_message(&phone.id, &stale));
+        let grant_body = serde_json::json!({
+            "device_id": phone.id,
+            "sig": grant_sig,
+            "challenge": stale,
+        })
+        .to_string();
+        let (status, raw) = http(expiring, "POST", "/v1/grant", &grant_body).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("bad_signature"));
     }
 }

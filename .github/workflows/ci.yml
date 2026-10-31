@@ -12,8 +12,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
       - name: cargo check
         run: cargo check --workspace --all-targets
       - name: cargo test
@@ -23,11 +25,18 @@ jobs:
         run: cargo check --manifest-path app/Cargo.toml --all-targets --locked
       - name: cargo test (app)
         run: cargo test --manifest-path app/Cargo.toml --locked
+      - uses: taiki-e/install-action@718993db25d12d67fe704d6aa97369e03d3803c8
+        with:
+          tool: cargo-deny
+      - name: cargo deny check (app)
+        run: cargo deny --manifest-path app/Cargo.toml check
 
   banned-names:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: fixture
         run: scripts/banned-names-fixture.sh
       - name: banned names
@@ -39,8 +48,12 @@ jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: taiki-e/install-action@718993db25d12d67fe704d6aa97369e03d3803c8
+        with:
+          tool: cargo-deny
       - name: cargo deny check
         run: cargo deny check

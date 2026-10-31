@@ -85,6 +85,13 @@ impl HerdrClient {
         &self.socket_path
     }
 
+    /// A client that dials `path` instead of the configured path.
+    pub fn with_socket_path(&self, path: impl AsRef<Path>) -> Self {
+        let mut next = self.clone();
+        next.socket_path = path.as_ref().to_path_buf();
+        next
+    }
+
     pub async fn snapshot(&self) -> Result<Snapshot, HerdrError> {
         let raw = self.rpc("session.snapshot", json!({})).await?;
         Ok(Snapshot::from_raw(raw))
@@ -399,7 +406,12 @@ mod tests {
         });
         let client = HerdrClient::with_herdr_bin(&sock, &bin);
         let err = client.rpc("ping", json!({})).await.unwrap_err();
-        assert!(matches!(err, HerdrError::LineTooLong { limit: MAX_HERDR_LINE }));
+        assert!(matches!(
+            err,
+            HerdrError::LineTooLong {
+                limit: MAX_HERDR_LINE
+            }
+        ));
         assert!(!marker.exists());
         server.await.unwrap();
     }

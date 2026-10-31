@@ -99,9 +99,13 @@ struct Up {
     kind: String,
     cols: Option<u16>,
     rows: Option<u16>,
-    /// Accepted and ignored. Reserved verbs stay refused.
+    /// Accepted and ignored on reserved verbs. `attach` verifies it.
     #[serde(default)]
     sig: Option<String>,
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    challenge: Option<String>,
 }
 
 pub async fn run_socket(socket: WebSocket, state: AppState) {
@@ -116,6 +120,7 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
     });
 
     let mut watches: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+    let mut attached: Option<String> = None;
     let fulls: std::sync::Arc<std::sync::Mutex<HashMap<String, WireFrame>>> =
         std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -130,7 +135,6 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
         if up.v != ENVELOPE_VERSION {
             continue;
         }
-        let _ignored_sig = up.sig;
         match up.kind.as_str() {
             "watch" => {
                 let already = watches.contains_key(&up.pane);
@@ -175,6 +179,16 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
                     let _ = tx.send(frame_json(&up.pane, &full)).await;
                 }
             }
+            "attach" => {
+                if let Some(id) = up.device_id.clone() {
+                    if state
+                        .pairing
+                        .attach(&id, up.sig.as_deref(), up.challenge.as_deref())
+                    {
+                        attached = Some(id);
+                    }
+                }
+            }
             "input" | "resize" | "scroll" => {
                 let _ = tx
                     .send(
@@ -193,6 +207,9 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
     }
     for handle in watches.into_values() {
         handle.abort();
+    }
+    if let Some(device) = attached {
+        state.pairing.release(&device);
     }
     writer.abort();
 }
@@ -309,14 +326,20 @@ pub fn admit_watch(open: usize, already: bool, pane: &str) -> Result<(), ()> {
 
 /// Writes are allowed only for `…/.config/herdr/sessions/<name>/herdr.sock`.
 /// `.` and `..` components are refused, including after symlink resolution.
-pub fn scratch_socket(path: &std::path::Path) -> bool {
+pub fn canonical_scratch(path: &std::path::Path) -> Option<std::path::PathBuf> {
     if has_dot_components(path) {
-        return false;
+        return None;
     }
-    match std::fs::canonicalize(path) {
-        Ok(canonical) => socket_shape(&canonical),
-        Err(_) => socket_shape(path),
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if socket_shape(&canonical) {
+        Some(canonical)
+    } else {
+        None
     }
+}
+
+pub fn scratch_socket(path: &std::path::Path) -> bool {
+    canonical_scratch(path).is_some()
 }
 
 fn has_dot_components(path: &std::path::Path) -> bool {
@@ -408,10 +431,30 @@ mod tests {
 
     #[test]
     fn scratch_socket_is_a_named_session_path() {
-        let ok = std::path::Path::new("/tmp/work/.config/herdr/sessions/g1/herdr.sock");
-        let live = std::path::Path::new("/tmp/work/.config/herdr/herdr.sock");
-        assert!(scratch_socket(ok));
-        assert!(!scratch_socket(live));
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        std::fs::create_dir_all(ok.parent().unwrap()).unwrap();
+        std::fs::write(&ok, b"").unwrap();
+        assert!(scratch_socket(&ok));
+        let live = dir.path().join(".config/herdr/herdr.sock");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, b"").unwrap();
+        assert!(!scratch_socket(&live));
+    }
+
+    #[test]
+    fn scratch_socket_rejects_a_missing_path_and_dotdot() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        assert!(!missing.exists());
+        assert!(std::fs::canonicalize(&missing).is_err());
+        assert!(!scratch_socket(&missing));
+
+        let walked = dir
+            .path()
+            .join(".config/herdr/sessions/g1/../../herdr.sock");
+        assert!(std::fs::canonicalize(&walked).is_err());
+        assert!(!scratch_socket(&walked));
     }
 
     #[test]
@@ -430,6 +473,21 @@ mod tests {
         std::os::unix::fs::symlink(&outside, sessions.join("alias")).unwrap();
         let linked = sessions.join("alias").join("herdr.sock");
         assert!(!scratch_socket(&linked));
+    }
+
+    #[test]
+    fn canonical_scratch_follows_a_symlink_that_stays_inside_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real/.config/herdr/sessions/g1/herdr.sock");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"").unwrap();
+        let link_dir = dir.path().join("link/.config/herdr/sessions/g1");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join("herdr.sock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved = canonical_scratch(&link).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&real).unwrap());
+        assert_ne!(resolved, link);
     }
 
     #[test]
@@ -531,6 +589,7 @@ mod dial {
             queue_cap: 8,
             bind: addr,
             serve_origin: None,
+            pairing: crate::pairing::Pairing::new(),
         };
         tokio::spawn(async move {
             let _ = axum::serve(tcp, crate::app(state)).await;
