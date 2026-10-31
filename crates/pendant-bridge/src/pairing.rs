@@ -1,5 +1,8 @@
-//! Device pairing for the phone. The phone creates the key. This crate verifies
-//! it. No key or token is minted here, and there is no relay.
+//! Device pairing for the phone. The phone creates the P-256 key. This crate
+//! verifies it. No key or token is minted here, and there is no relay.
+//!
+//! The wire format is `ecdsa-p256-sha256`: a SEC1 uncompressed public key
+//! (`0x04 || X || Y`) and an ASN.1 DER signature over SHA-256 of the message.
 //!
 //! A real phone is not paired by these tests. Lost-phone revoke is covered
 //! first, while `real_pairings` stays zero.
@@ -10,12 +13,17 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature, VerifyingKey};
 
 /// Session takeover is not implemented.
 pub const TAKEOVER: bool = false;
 
+/// Name of the phone signature algorithm.
+pub const DEVICE_SIGNATURE: &str = "ecdsa-p256-sha256";
+
 const GRANT_TTL: Duration = Duration::from_secs(30);
+const MAX_CHALLENGES: usize = 64;
 
 #[derive(Clone)]
 pub struct Pairing {
@@ -25,6 +33,7 @@ pub struct Pairing {
 struct Inner {
     ttl: Duration,
     nonces: Vec<String>,
+    challenges: Vec<String>,
     devices: HashMap<String, Device>,
     grants: HashMap<String, Grant>,
 }
@@ -49,6 +58,7 @@ impl Pairing {
             inner: std::sync::Arc::new(Mutex::new(Inner {
                 ttl,
                 nonces: Vec::new(),
+                challenges: Vec::new(),
                 devices: HashMap::new(),
                 grants: HashMap::new(),
             })),
@@ -69,21 +79,24 @@ impl Pairing {
     }
 
     pub fn issue_nonce(&self) -> String {
-        let mut bytes = [0u8; 16];
-        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut bytes);
-        let nonce = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        self.inner
-            .lock()
-            .expect("pairing")
-            .nonces
-            .push(nonce.clone());
+        let nonce = random_token();
+        let mut inner = self.inner.lock().expect("pairing");
+        push_capped(&mut inner.nonces, nonce.clone());
         nonce
+    }
+
+    pub fn issue_challenge(&self) -> String {
+        let challenge = random_token();
+        let mut inner = self.inner.lock().expect("pairing");
+        push_capped(&mut inner.challenges, challenge.clone());
+        challenge
     }
 
     pub fn qr_payload(nonce: &str) -> String {
         format!("pendant-pair:v1:{nonce}")
     }
 
+    /// The check and the insert share one lock. A revoked id is not overwritten.
     pub fn pair(
         &self,
         device_id: &str,
@@ -92,17 +105,26 @@ impl Pairing {
         sig_b64: &str,
         takeover: bool,
     ) -> Result<(), AuthError> {
-        if takeover || self.other_device_active(device_id) {
-            if self.other_device_active(device_id) {
-                return Err(AuthError::TakeoverOff);
-            }
-        }
         let public = decode_key(public_b64).map_err(|_| AuthError::BadSignature)?;
-        let msg = pair_message(nonce);
+        let msg = pair_message(device_id, public_b64, nonce);
         if !verify(&public, &msg, sig_b64) {
             return Err(AuthError::BadSignature);
         }
         let mut inner = self.inner.lock().expect("pairing");
+        if inner
+            .devices
+            .get(device_id)
+            .is_some_and(|device| device.revoked)
+        {
+            return Err(AuthError::Revoked);
+        }
+        let other = inner
+            .devices
+            .iter()
+            .any(|(id, device)| id != device_id && !device.revoked);
+        if other && (takeover || !TAKEOVER) {
+            return Err(AuthError::TakeoverOff);
+        }
         let Some(pos) = inner.nonces.iter().position(|n| n == nonce) else {
             return Err(AuthError::BadSignature);
         };
@@ -117,27 +139,48 @@ impl Pairing {
         Ok(())
     }
 
-    pub fn revoke(&self, device_id: &str) {
+    /// Auth is a signature from an already paired device over a fresh challenge.
+    /// Unknown ids are not stored.
+    pub fn revoke(
+        &self,
+        target_id: &str,
+        signer_id: &str,
+        sig_b64: &str,
+        challenge: &str,
+    ) -> Result<(), AuthError> {
+        let msg = revoke_message(target_id, challenge);
         let mut inner = self.inner.lock().expect("pairing");
-        if let Some(device) = inner.devices.get_mut(device_id) {
-            device.revoked = true;
-        } else {
-            inner.devices.insert(
-                device_id.to_string(),
-                Device {
-                    public: dummy_key(),
-                    revoked: true,
-                },
-            );
+        if !take_challenge(&mut inner.challenges, challenge) {
+            return Err(AuthError::BadSignature);
         }
-        if let Some(grant) = inner.grants.get_mut(device_id) {
+        let Some(signer) = inner.devices.get(signer_id) else {
+            return Err(AuthError::BadSignature);
+        };
+        if signer.revoked {
+            return Err(AuthError::Revoked);
+        }
+        let public = signer.public.clone();
+        if !verify(&public, &msg, sig_b64) {
+            return Err(AuthError::BadSignature);
+        }
+        let Some(target) = inner.devices.get_mut(target_id) else {
+            return Ok(());
+        };
+        target.revoked = true;
+        if let Some(grant) = inner.grants.get_mut(target_id) {
             grant.released = true;
         }
+        Ok(())
     }
 
-    pub fn open_grant(&self, device_id: &str, sig_b64: &str) -> Result<(), AuthError> {
-        let msg = grant_message(device_id);
-        self.verify_device(device_id, &msg, sig_b64)?;
+    pub fn open_grant(
+        &self,
+        device_id: &str,
+        sig_b64: &str,
+        challenge: &str,
+    ) -> Result<(), AuthError> {
+        let msg = grant_message(device_id, challenge);
+        self.verify_fresh(device_id, &msg, sig_b64, challenge)?;
         let mut inner = self.inner.lock().expect("pairing");
         inner.grants.insert(
             device_id.to_string(),
@@ -154,8 +197,9 @@ impl Pairing {
         device_id: &str,
         message: &[u8],
         sig_b64: &str,
+        challenge: &str,
     ) -> Result<(), AuthError> {
-        self.verify_device(device_id, message, sig_b64)?;
+        self.verify_fresh(device_id, message, sig_b64, challenge)?;
         let mut inner = self.inner.lock().expect("pairing");
         let ttl = inner.ttl;
         let Some(grant) = inner.grants.get_mut(device_id) else {
@@ -171,15 +215,12 @@ impl Pairing {
         Ok(())
     }
 
-    pub fn attach(&self, device_id: &str, sig_b64: Option<&str>) -> bool {
-        let Some(sig_b64) = sig_b64 else {
+    pub fn attach(&self, device_id: &str, sig_b64: Option<&str>, challenge: Option<&str>) -> bool {
+        let (Some(sig_b64), Some(challenge)) = (sig_b64, challenge) else {
             return false;
         };
-        let msg = attach_message(device_id);
-        if self.authorize(device_id, &msg, sig_b64).is_err() {
-            return false;
-        }
-        true
+        let msg = attach_message(device_id, challenge);
+        self.authorize(device_id, &msg, sig_b64, challenge).is_ok()
     }
 
     pub fn release(&self, device_id: &str) {
@@ -189,32 +230,30 @@ impl Pairing {
         }
     }
 
-    fn verify_device(
+    fn verify_fresh(
         &self,
         device_id: &str,
         message: &[u8],
         sig_b64: &str,
+        challenge: &str,
     ) -> Result<(), AuthError> {
-        let inner = self.inner.lock().expect("pairing");
+        let mut inner = self.inner.lock().expect("pairing");
+        if !take_challenge(&mut inner.challenges, challenge) {
+            return Err(AuthError::BadSignature);
+        }
         let Some(device) = inner.devices.get(device_id) else {
             return Err(AuthError::BadSignature);
         };
         if device.revoked {
             return Err(AuthError::Revoked);
         }
-        if verify(&device.public, message, sig_b64) {
+        let public = device.public.clone();
+        drop(inner);
+        if verify(&public, message, sig_b64) {
             Ok(())
         } else {
             Err(AuthError::BadSignature)
         }
-    }
-
-    fn other_device_active(&self, device_id: &str) -> bool {
-        let inner = self.inner.lock().expect("pairing");
-        inner
-            .devices
-            .iter()
-            .any(|(id, device)| id != device_id && !device.revoked)
     }
 }
 
@@ -232,27 +271,58 @@ pub fn unpaired_log(host: &str) -> String {
     format!("unpaired device refused via=serve host={host}")
 }
 
-pub fn sign_message(device_id: &str, method: &str, path: &str, canonical: &str) -> Vec<u8> {
-    format!("pendant-sign:v1\n{device_id}\n{method}\n{path}\n{canonical}").into_bytes()
+pub fn sign_message(
+    device_id: &str,
+    method: &str,
+    path: &str,
+    challenge: &str,
+    canonical: &str,
+) -> Vec<u8> {
+    format!("pendant-sign:v1\n{device_id}\n{method}\n{path}\n{challenge}\n{canonical}").into_bytes()
 }
 
-pub fn pair_message(nonce: &str) -> Vec<u8> {
-    format!("pendant-pair:v1:{nonce}").into_bytes()
+pub fn pair_message(device_id: &str, public_b64: &str, nonce: &str) -> Vec<u8> {
+    format!("pendant-pair:v1\n{device_id}\n{public_b64}\n{nonce}").into_bytes()
 }
 
-pub fn grant_message(device_id: &str) -> Vec<u8> {
-    format!("pendant-grant:v1\n{device_id}\nforeground").into_bytes()
+pub fn grant_message(device_id: &str, challenge: &str) -> Vec<u8> {
+    format!("pendant-grant:v1\n{device_id}\n{challenge}").into_bytes()
 }
 
-pub fn attach_message(device_id: &str) -> Vec<u8> {
-    format!("pendant-attach:v1\n{device_id}").into_bytes()
+pub fn attach_message(device_id: &str, challenge: &str) -> Vec<u8> {
+    format!("pendant-attach:v1\n{device_id}\n{challenge}").into_bytes()
+}
+
+pub fn revoke_message(target_id: &str, challenge: &str) -> Vec<u8> {
+    format!("pendant-revoke:v1\n{target_id}\n{challenge}").into_bytes()
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("random");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn push_capped(items: &mut Vec<String>, item: String) {
+    if items.len() >= MAX_CHALLENGES {
+        items.remove(0);
+    }
+    items.push(item);
+}
+
+fn take_challenge(challenges: &mut Vec<String>, challenge: &str) -> bool {
+    let Some(pos) = challenges.iter().position(|item| item == challenge) else {
+        return false;
+    };
+    challenges.remove(pos);
+    true
 }
 
 fn verify(key: &VerifyingKey, message: &[u8], sig_b64: &str) -> bool {
     let Ok(bytes) = STANDARD.decode(sig_b64.trim()) else {
         return false;
     };
-    let Ok(sig) = Signature::from_slice(&bytes) else {
+    let Ok(sig) = Signature::from_der(&bytes) else {
         return false;
     };
     key.verify(message, &sig).is_ok()
@@ -260,18 +330,24 @@ fn verify(key: &VerifyingKey, message: &[u8], sig_b64: &str) -> bool {
 
 fn decode_key(public_b64: &str) -> Result<VerifyingKey, ()> {
     let bytes = STANDARD.decode(public_b64.trim()).map_err(|_| ())?;
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| ())?;
-    VerifyingKey::from_bytes(&bytes).map_err(|_| ())
-}
-
-fn dummy_key() -> VerifyingKey {
-    ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key()
+    VerifyingKey::from_sec1_bytes(&bytes).map_err(|_| ())
 }
 
 #[cfg(test)]
 pub struct TestDevice {
     pub id: String,
-    signing: ed25519_dalek::SigningKey,
+    signing: p256::ecdsa::SigningKey,
+}
+
+#[cfg(test)]
+fn random_signing_key() -> p256::ecdsa::SigningKey {
+    loop {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("random");
+        if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+            return key;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -279,16 +355,18 @@ impl TestDevice {
     pub fn generate(id: &str) -> Self {
         Self {
             id: id.to_string(),
-            signing: ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+            signing: random_signing_key(),
         }
     }
 
     pub fn public_b64(&self) -> String {
-        STANDARD.encode(self.signing.verifying_key().as_bytes())
+        let point = self.signing.verifying_key().to_sec1_point(false);
+        STANDARD.encode(point.as_bytes())
     }
 
     pub fn sign_b64(&self, message: &[u8]) -> String {
-        use ed25519_dalek::Signer;
-        STANDARD.encode(self.signing.sign(message).to_bytes())
+        use p256::ecdsa::signature::Signer;
+        let sig: Signature = self.signing.sign(message);
+        STANDARD.encode(sig.to_der().as_bytes())
     }
 }

@@ -104,6 +104,8 @@ struct Up {
     sig: Option<String>,
     #[serde(default)]
     device_id: Option<String>,
+    #[serde(default)]
+    challenge: Option<String>,
 }
 
 pub async fn run_socket(socket: WebSocket, state: AppState) {
@@ -179,7 +181,10 @@ pub async fn run_socket(socket: WebSocket, state: AppState) {
             }
             "attach" => {
                 if let Some(id) = up.device_id.clone() {
-                    if state.pairing.attach(&id, up.sig.as_deref()) {
+                    if state
+                        .pairing
+                        .attach(&id, up.sig.as_deref(), up.challenge.as_deref())
+                    {
                         attached = Some(id);
                     }
                 }
@@ -327,7 +332,7 @@ pub fn scratch_socket(path: &std::path::Path) -> bool {
     }
     match std::fs::canonicalize(path) {
         Ok(canonical) => socket_shape(&canonical),
-        Err(_) => socket_shape(path),
+        Err(_) => false,
     }
 }
 
@@ -420,19 +425,24 @@ mod tests {
 
     #[test]
     fn scratch_socket_is_a_named_session_path() {
-        let ok = std::path::Path::new("/tmp/work/.config/herdr/sessions/g1/herdr.sock");
-        let live = std::path::Path::new("/tmp/work/.config/herdr/herdr.sock");
-        assert!(scratch_socket(ok));
-        assert!(!scratch_socket(live));
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        std::fs::create_dir_all(ok.parent().unwrap()).unwrap();
+        std::fs::write(&ok, b"").unwrap();
+        assert!(scratch_socket(&ok));
+        let live = dir.path().join(".config/herdr/herdr.sock");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, b"").unwrap();
+        assert!(!scratch_socket(&live));
     }
 
     #[test]
-    fn scratch_socket_allows_a_missing_path_and_still_rejects_dotdot() {
+    fn scratch_socket_rejects_a_missing_path_and_dotdot() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
         assert!(!missing.exists());
         assert!(std::fs::canonicalize(&missing).is_err());
-        assert!(scratch_socket(&missing));
+        assert!(!scratch_socket(&missing));
 
         let walked = dir
             .path()
