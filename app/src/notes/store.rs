@@ -2,7 +2,7 @@
 //!
 //! One worker thread owns the [`Engine`]. The UI thread only hands it jobs, so
 //! opening the index, refreshing it, searching and capturing never run on the
-//! UI thread. The index lives in a caller-chosen directory in app-private
+//! UI thread. The index lives in a directory the store picks in app-private
 //! storage, never in the vault, and is excluded from backups. Search is
 //! keyword (FTS5); the embedder is `None`. Capture goes through
 //! [`lapis_notes::create_new`], which writes a new file and never overwrites.
@@ -16,19 +16,24 @@ use std::thread::{self, JoinHandle};
 use lapis_lattice::{Engine, Hit, RefreshReport};
 use lapis_notes::{CreateRequest, WrittenNote};
 
+// Until app/src/lib.rs lands this file is the library root (see Cargo.toml),
+// so the platform keystore mounts here.
+#[path = "../platform/keystore.rs"]
+pub mod keystore;
+
 /// Name of the store's worker thread.
 pub const WORKER: &str = "pendant-notes";
 
-/// Where the store reads the vault and keeps its index.
+/// The index directory's name inside the app's private storage.
+const INDEX: &str = "notes-index";
+
+/// Where the store reads the vault. There is no index directory here: the
+/// store picks it in app-private storage (see [`Store::open`]), so a caller
+/// cannot name one, a symlink included.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The vault root. The store writes nothing in it except a new capture.
     pub vault: PathBuf,
-    /// The index directory, in app-private storage. On iOS, a directory under
-    /// Application Support; the store marks it excluded from backups. On
-    /// Android, a directory under `Context.getNoBackupFilesDir()`, which the
-    /// OS already leaves out of Auto Backup; anything else is refused.
-    pub index_dir: PathBuf,
     /// The inbox bucket captures land in. Always passed to `create_new`, so
     /// the vault's `.lapis/vault.json` is never consulted.
     pub inbox: String,
@@ -50,7 +55,8 @@ pub type OnRefresh = Box<dyn Fn(Trigger, Result<RefreshReport, StoreError>) + Se
 pub struct Captured {
     pub note: WrittenNote,
     /// Why the new note is not searchable yet. The file is on disk either
-    /// way, and the next refresh indexes it.
+    /// way, and the next refresh indexes it. Never carries a path, so a UI
+    /// may log it.
     pub index_error: Option<String>,
 }
 
@@ -105,16 +111,50 @@ pub struct Store {
 }
 
 impl Store {
-    /// Start the worker and open the index there. Returns once the index is
-    /// open, or with the refusal: an index directory that is the vault, inside
-    /// it, reached through `..`, or through a symlink into it is refused
-    /// before anything is written.
+    /// Start the worker and open the index in the app's private storage:
+    /// `Library/Application Support/Pendant/notes-index` under the app's home
+    /// on iOS, `no_backup/notes-index` in the app's data directory on Android.
+    /// Returns once the index is open, or with the refusal. Nothing the caller
+    /// passes names that directory:
+    ///
+    /// ```no_run
+    /// use pendant_app::{Config, Store};
+    /// let config = Config { vault: "/vault".into(), inbox: "inbox".into() };
+    /// let store = Store::open(config, Box::new(|_, _| {}));
+    /// ```
+    ///
+    /// ```compile_fail,E0560
+    /// use pendant_app::{Config, Store};
+    /// let config = Config {
+    ///     vault: "/vault".into(),
+    ///     index_dir: "/tmp/link-to-anywhere".into(),
+    ///     inbox: "inbox".into(),
+    /// };
+    /// let store = Store::open(config, Box::new(|_, _| {}));
+    /// ```
+    ///
+    /// ```compile_fail,E0061
+    /// use pendant_app::{Config, Store};
+    /// let config = Config { vault: "/vault".into(), inbox: "inbox".into() };
+    /// let store = Store::open(config, "/tmp/link-to-anywhere", Box::new(|_, _| {}));
+    /// ```
     pub fn open(config: Config, on_refresh: OnRefresh) -> Result<Store, StoreError> {
+        Store::open_in(config, app_index_dir()?, on_refresh)
+    }
+
+    /// The engine still refuses an index directory that is the vault, inside
+    /// it, reached through `..`, or through a symlink into it, before anything
+    /// is written. Not public: only [`app_index_dir`] and tests choose `index_dir`.
+    fn open_in(
+        config: Config,
+        index_dir: PathBuf,
+        on_refresh: OnRefresh,
+    ) -> Result<Store, StoreError> {
         let (jobs, queue) = mpsc::channel();
         let (opened, open_result) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(WORKER.into())
-            .spawn(move || match open_engine(&config) {
+            .spawn(move || match open_engine(&config, &index_dir) {
                 Ok(engine) => {
                     let _ = opened.send(Ok(engine.db_path()));
                     run(engine, &config, queue, on_refresh);
@@ -204,12 +244,11 @@ impl Drop for Store {
     }
 }
 
-fn open_engine(config: &Config) -> Result<Engine, StoreError> {
-    check_backup_location(&config.index_dir)?;
+fn open_engine(config: &Config, index_dir: &Path) -> Result<Engine, StoreError> {
+    check_backup_location(index_dir)?;
     // Confinement is the engine's: it resolves the directory, refuses `..`,
     // the vault and anything inside it, and writes nothing when it refuses.
-    let engine =
-        Engine::open_in(&config.vault, &config.index_dir, None).map_err(StoreError::Index)?;
+    let engine = Engine::open_in(&config.vault, index_dir, None).map_err(StoreError::Index)?;
     if let Some(dir) = engine.db_path().parent() {
         exclude_from_backup(dir)?;
     }
@@ -256,8 +295,26 @@ fn capture(
         ..Default::default()
     };
     let note = lapis_notes::create_new(&config.vault, &req, None).map_err(StoreError::Capture)?;
-    let index_error = engine.reindex_path(&note.path).err().map(|e| e.to_string());
+    let index_error = engine
+        .reindex_path(&note.path)
+        .err()
+        .map(|e| index_failure(&e));
     Ok(Captured { note, index_error })
+}
+
+/// The engine's own messages can carry vault paths (an I/O error, a refused
+/// note, a SQLite message), so only the kind of failure goes out.
+fn index_failure(e: &lapis_lattice::Error) -> String {
+    match e {
+        lapis_lattice::Error::Usage(_) => "the index refused the note".into(),
+        lapis_lattice::Error::Io(e) => {
+            format!("the index could not read the note ({:?})", e.kind())
+        }
+        lapis_lattice::Error::Sqlite(e) => match e.sqlite_error_code() {
+            Some(code) => format!("the index could not store the note (SQLite {code:?})"),
+            None => "the index could not store the note (SQLite)".into(),
+        },
+    }
 }
 
 fn check_date(created: &str) -> Result<(), StoreError> {
@@ -278,20 +335,83 @@ fn check_date(created: &str) -> Result<(), StoreError> {
     }
 }
 
-/// Android leaves `getNoBackupFilesDir()` out of Auto Backup and device
-/// transfer. The index must sit under it.
+/// The index directory in the app's private storage. It comes from the
+/// platform, never from a caller.
+fn app_index_dir() -> Result<PathBuf, StoreError> {
+    #[cfg(target_os = "android")]
+    let dir = android_data_dir()?.join("no_backup").join(INDEX);
+    // iOS sets HOME to the app's sandbox container. macOS dev hosts use the
+    // user's own Library.
+    #[cfg(target_vendor = "apple")]
+    let dir = home()?
+        .join("Library/Application Support/Pendant")
+        .join(INDEX);
+    #[cfg(not(any(target_os = "android", target_vendor = "apple")))]
+    let dir = home()?.join(".local/share/pendant").join(INDEX);
+    Ok(dir)
+}
+
+#[cfg(not(target_os = "android"))]
+fn home() -> Result<PathBuf, StoreError> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .ok_or_else(|| StoreError::Backup("HOME is not set to an absolute path".into()))
+}
+
+/// This app's data directory on internal storage, laid out the way Android
+/// lays out `Context.getDataDir()`: `/data/user/<user>/<package>`. The user is
+/// the process uid over 100000; the package is the process name up to `:`.
+#[cfg(target_os = "android")]
+fn android_data_dir() -> Result<PathBuf, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let proc_err = |e: std::io::Error| StoreError::Backup(format!("/proc/self: {e}"));
+    let uid = std::fs::metadata("/proc/self").map_err(proc_err)?.uid();
+    let cmdline = std::fs::read("/proc/self/cmdline").map_err(proc_err)?;
+    data_dir_for(uid, &cmdline)
+        .ok_or_else(|| StoreError::Backup("the process name is not an app package".into()))
+}
+
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-fn under_no_backup(index_dir: &Path) -> bool {
-    index_dir.components().any(|c| c.as_os_str() == "no_backup")
+fn data_dir_for(uid: u32, cmdline: &[u8]) -> Option<PathBuf> {
+    let name = cmdline.split(|b| *b == 0).next()?;
+    let package = std::str::from_utf8(name).ok()?.split(':').next()?;
+    let segment_ok = |s: &str| {
+        s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if !package.contains('.') || !package.split('.').all(segment_ok) {
+        return None;
+    }
+    Some(PathBuf::from(format!(
+        "/data/user/{}/{package}",
+        uid / 100_000
+    )))
+}
+
+/// Backup hygiene, not the platform no-backup API. This is not
+/// `Context.getNoBackupFilesDir()`: nothing here calls into Android, and no
+/// symlink is resolved. It checks the path's shape only: the index must sit
+/// in the `no_backup` directory directly inside `data_dir`, the app's own
+/// data directory, which Auto Backup and device transfer leave out. A
+/// `no_backup` component anywhere else is a decoy and fails, and so does any
+/// `..`. It is not a security boundary.
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+fn in_no_backup(index_dir: &Path, data_dir: &Path) -> bool {
+    use std::path::Component;
+    let Ok(rest) = index_dir.strip_prefix(data_dir.join("no_backup")) else {
+        return false;
+    };
+    rest.components().next().is_some()
+        && rest.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
 fn check_backup_location(index_dir: &Path) -> Result<(), StoreError> {
     #[cfg(target_os = "android")]
-    if !under_no_backup(index_dir) {
-        return Err(StoreError::Backup(format!(
-            "{} is not under the app's no_backup directory",
-            index_dir.display()
-        )));
+    if !in_no_backup(index_dir, &android_data_dir()?) {
+        return Err(StoreError::Backup(
+            "the index is not in the app's no_backup directory".into(),
+        ));
     }
     let _ = index_dir;
     Ok(())
@@ -305,8 +425,14 @@ fn exclude_from_backup(dir: &Path) -> Result<(), StoreError> {
         .ok_or_else(|| StoreError::Backup(format!("{} is not UTF-8", dir.display())))?;
     let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(path), true);
     let yes = NSNumber::new_bool(true);
-    unsafe { url.setResourceValue_forKey_error(Some(&yes), NSURLIsExcludedFromBackupKey) }
-        .map_err(|e| StoreError::Backup(e.localizedDescription().to_string()))
+    // SAFETY: `url` is a typed file NSURL built from a UTF-8 path above, and
+    // `yes` is an NSNumber, the value type NSURLIsExcludedFromBackupKey takes.
+    // The key is a Foundation constant read only here. objc2 turns the
+    // NSError out-parameter into the `Err` that is mapped below, so a failure
+    // is returned, not dropped.
+    let set =
+        unsafe { url.setResourceValue_forKey_error(Some(&yes), NSURLIsExcludedFromBackupKey) };
+    set.map_err(|e| StoreError::Backup(e.localizedDescription().to_string()))
 }
 
 /// Android: the location is the exclusion, checked before the index opened.
@@ -382,18 +508,20 @@ mod tests {
         id: ThreadId,
     }
 
-    fn config(vault: &Path, index_dir: &Path) -> Config {
+    fn config(vault: &Path) -> Config {
         Config {
             vault: vault.to_path_buf(),
-            index_dir: index_dir.to_path_buf(),
             inbox: "inbox".into(),
         }
     }
 
-    fn open(config: Config) -> (Store, Receiver<Refreshed>) {
+    /// Tests pick a scratch index directory through the crate-private
+    /// `open_in`; the public `open` takes none.
+    fn open(config: Config, index_dir: &Path) -> (Store, Receiver<Refreshed>) {
         let (tx, rx) = mpsc::channel();
-        let store = Store::open(
+        let store = Store::open_in(
             config,
+            index_dir.to_path_buf(),
             Box::new(move |trigger, result| {
                 let me = thread::current();
                 let _ = tx.send(Refreshed {
@@ -449,6 +577,8 @@ mod tests {
         let url =
             NSURL::fileURLWithPath_isDirectory(&NSString::from_str(dir.to_str().unwrap()), true);
         let mut value = None;
+        // SAFETY: a typed file NSURL, a Foundation key constant, and an
+        // out-slot objc2 types as Option<Retained<AnyObject>>.
         unsafe { url.getResourceValue_forKey_error(&mut value, NSURLIsExcludedFromBackupKey) }
             .unwrap();
         value
@@ -464,7 +594,7 @@ mod tests {
         let before = tree(&v);
         let app = dir("app");
         let index = app.join("Library/Application Support/notes-index");
-        let (store, done) = open(config(&v, &index));
+        let (store, done) = open(config(&v), &index);
 
         assert_eq!(store.index_dir(), index.canonicalize().unwrap());
         assert!(store.index_dir().join("lattice.sqlite").is_file());
@@ -500,7 +630,7 @@ mod tests {
             outside.join("in-vault/deeper"),
         ];
         for index in cases {
-            let err = Store::open(config(&v, &index), Box::new(|_, _| {}))
+            let err = Store::open_in(config(&v), index.clone(), Box::new(|_, _| {}))
                 .err()
                 .expect("refused");
             assert!(
@@ -534,7 +664,7 @@ mod tests {
     fn refresh_runs_off_the_calling_thread() {
         let v = vault();
         let app = dir("app");
-        let (store, done) = open(config(&v, &app.join("index")));
+        let (store, done) = open(config(&v), &app.join("index"));
         let ui = thread::current().id();
 
         store.launched().unwrap();
@@ -557,7 +687,7 @@ mod tests {
     fn a_no_change_refresh_writes_nothing() {
         let v = vault();
         let app = dir("app");
-        let (store, done) = open(config(&v, &app.join("index")));
+        let (store, done) = open(config(&v), &app.join("index"));
         store.launched().unwrap();
         assert_eq!(counts(&next(&done).result.unwrap()), (2, 0, 0));
 
@@ -590,7 +720,7 @@ mod tests {
     fn a_failed_refresh_rolls_back() {
         let v = vault();
         let app = dir("app");
-        let (store, done) = open(config(&v, &app.join("index")));
+        let (store, done) = open(config(&v), &app.join("index"));
         store.launched().unwrap();
         assert_eq!(counts(&next(&done).result.unwrap()), (2, 0, 0));
 
@@ -659,7 +789,7 @@ mod tests {
         )
         .unwrap();
         let app = dir("app");
-        let (store, done) = open(config(&v, &app.join("index")));
+        let (store, done) = open(config(&v), &app.join("index"));
         store.launched().unwrap();
         next(&done).result.unwrap();
 
@@ -703,7 +833,7 @@ mod tests {
     fn capture_refuses_a_date_that_is_not_iso() {
         let v = vault();
         let app = dir("app");
-        let (store, _done) = open(config(&v, &app.join("index")));
+        let (store, _done) = open(config(&v), &app.join("index"));
         for bad in [
             "30/10/2026",
             "2026-13-01",
@@ -721,13 +851,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&app);
     }
 
+    /// G0d: a reindex failure whose engine message carries the vault's path
+    /// comes back on `index_error` with no path in it, and the note is still
+    /// written.
     #[test]
-    fn android_index_must_sit_under_no_backup() {
-        assert!(under_no_backup(Path::new(
+    fn a_reindex_failure_carries_no_vault_path() {
+        let v = vault();
+        let app = dir("app");
+        let (store, done) = open(config(&v), &app.join("index"));
+        store.launched().unwrap();
+        next(&done).result.unwrap();
+
+        let leak = v.canonicalize().unwrap().join("inbox/Leak.md");
+        let probe = rusqlite::Connection::open(store.index_dir().join("lattice.sqlite")).unwrap();
+        probe
+            .execute_batch(&format!(
+                "CREATE TRIGGER leak BEFORE INSERT ON documents WHEN NEW.path LIKE 'inbox/%' \
+                 BEGIN SELECT RAISE(ABORT, '{}'); END;",
+                leak.display()
+            ))
+            .unwrap();
+
+        let captured = store
+            .capture("Leak", Some("Body.\n"), "2026-10-30")
+            .unwrap();
+        assert!(v.join(&captured.note.path).is_file(), "the note is written");
+        let message = captured.index_error.expect("the reindex failed");
+        assert!(!message.contains('/'), "{message}");
+        assert!(!message.contains(v.to_str().unwrap()), "{message}");
+        assert!(!message.contains("Leak"), "{message}");
+        drop(probe);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&v);
+        let _ = std::fs::remove_dir_all(&app);
+    }
+
+    /// G0b: only the `no_backup` directly inside the app's data directory
+    /// passes. A decoy `no_backup` anywhere else fails, and so does `..`.
+    #[test]
+    fn a_decoy_no_backup_component_fails_the_hygiene_check() {
+        let data = Path::new("/data/user/0/com.hedronite.pendant");
+        let ok = |p: &str| in_no_backup(Path::new(p), data);
+        assert!(ok(
             "/data/user/0/com.hedronite.pendant/no_backup/notes-index"
-        )));
-        assert!(!under_no_backup(Path::new(
-            "/data/user/0/com.hedronite.pendant/files/notes-index"
-        )));
+        ));
+        for decoy in [
+            "/data/user/0/com.hedronite.pendant/files/no_backup/notes-index",
+            "/data/user/0/com.hedronite.pendant/cache/no_backup",
+            "/sdcard/no_backup/notes-index",
+            "/storage/emulated/0/Android/data/com.hedronite.pendant/no_backup/notes-index",
+            "/data/user/0/com.other.app/no_backup/notes-index",
+            "/data/user/10/com.hedronite.pendant/no_backup/notes-index",
+            "/data/user/0/com.hedronite.pendant/no_backup/../files/notes-index",
+            "/data/user/0/com.hedronite.pendant/no_backup/./notes-index/..",
+            "/data/user/0/com.hedronite.pendant/no_backup",
+            "/data/user/0/com.hedronite.pendant/files/notes-index",
+        ] {
+            assert!(!ok(decoy), "{decoy}");
+        }
+    }
+
+    /// The data directory comes from the process uid and name, never from a
+    /// caller, and a process name that is not a package gives none.
+    #[test]
+    fn the_android_data_dir_is_derived_from_the_process() {
+        let d = |uid, cmd: &[u8]| data_dir_for(uid, cmd).map(|p| p.display().to_string());
+        assert_eq!(
+            d(10_123, b"com.hedronite.pendant\0"),
+            Some("/data/user/0/com.hedronite.pendant".into())
+        );
+        assert_eq!(
+            d(1_010_123, b"com.hedronite.pendant:sync\0"),
+            Some("/data/user/10/com.hedronite.pendant".into())
+        );
+        for bad in [
+            &b"sh\0"[..],
+            b"../../tmp\0",
+            b"com.x/../y\0",
+            b"com..x\0",
+            b"\0",
+            b"",
+        ] {
+            assert_eq!(d(10_123, bad), None, "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    /// G0c: the public `open` names its own index directory in app-private
+    /// storage; `Config` has no field to name another (see the compile_fail
+    /// examples on `Store::open`).
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn the_index_directory_is_the_apps_own() {
+        let dir = app_index_dir().unwrap();
+        assert!(dir.starts_with(home().unwrap()), "{}", dir.display());
+        assert!(dir.ends_with(INDEX), "{}", dir.display());
     }
 }
