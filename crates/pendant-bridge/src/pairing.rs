@@ -32,10 +32,19 @@ pub struct Pairing {
 
 struct Inner {
     ttl: Duration,
+    challenge_ttl: Duration,
+    challenge_rate: usize,
+    challenge_window: Duration,
     nonces: Vec<String>,
-    challenges: Vec<String>,
+    challenges: Vec<Ticket>,
+    recent: Vec<Instant>,
     devices: HashMap<String, Device>,
     grants: HashMap<String, Grant>,
+}
+
+struct Ticket {
+    token: String,
+    issued: Instant,
 }
 
 struct Device {
@@ -57,12 +66,25 @@ impl Pairing {
         Self {
             inner: std::sync::Arc::new(Mutex::new(Inner {
                 ttl,
+                challenge_ttl: GRANT_TTL,
+                challenge_rate: 32,
+                challenge_window: Duration::from_secs(1),
                 nonces: Vec::new(),
                 challenges: Vec::new(),
+                recent: Vec::new(),
                 devices: HashMap::new(),
                 grants: HashMap::new(),
             })),
         }
+    }
+
+    pub fn with_challenge_limit(rate: usize, challenge_ttl: Duration) -> Self {
+        let pairing = Self::new();
+        let mut inner = pairing.inner.lock().expect("pairing");
+        inner.challenge_rate = rate.max(1);
+        inner.challenge_ttl = challenge_ttl;
+        drop(inner);
+        pairing
     }
 
     /// No real phone has been paired. Tests assert this stays zero.
@@ -85,11 +107,31 @@ impl Pairing {
         nonce
     }
 
-    pub fn issue_challenge(&self) -> String {
-        let challenge = random_token();
+    pub fn issue_challenge(&self) -> Result<String, AuthError> {
         let mut inner = self.inner.lock().expect("pairing");
-        push_capped(&mut inner.challenges, challenge.clone());
-        challenge
+        let now = Instant::now();
+        let ttl = inner.challenge_ttl;
+        let window = inner.challenge_window;
+        let rate = inner.challenge_rate;
+        inner
+            .challenges
+            .retain(|ticket| now.saturating_duration_since(ticket.issued) <= ttl);
+        inner
+            .recent
+            .retain(|issued| now.saturating_duration_since(*issued) <= window);
+        if inner.recent.len() >= rate {
+            return Err(AuthError::RateLimited);
+        }
+        let challenge = random_token();
+        inner.recent.push(now);
+        if inner.challenges.len() >= MAX_CHALLENGES {
+            inner.challenges.remove(0);
+        }
+        inner.challenges.push(Ticket {
+            token: challenge.clone(),
+            issued: now,
+        });
+        Ok(challenge)
     }
 
     pub fn qr_payload(nonce: &str) -> String {
@@ -125,10 +167,9 @@ impl Pairing {
         if other && (takeover || !TAKEOVER) {
             return Err(AuthError::TakeoverOff);
         }
-        let Some(pos) = inner.nonces.iter().position(|n| n == nonce) else {
+        if !take_token(&mut inner.nonces, nonce) {
             return Err(AuthError::BadSignature);
-        };
-        inner.nonces.remove(pos);
+        }
         inner.devices.insert(
             device_id.to_string(),
             Device {
@@ -150,7 +191,7 @@ impl Pairing {
     ) -> Result<(), AuthError> {
         let msg = revoke_message(target_id, challenge);
         let mut inner = self.inner.lock().expect("pairing");
-        if !take_challenge(&mut inner.challenges, challenge) {
+        if !take_ticket(&mut inner, challenge) {
             return Err(AuthError::BadSignature);
         }
         let Some(signer) = inner.devices.get(signer_id) else {
@@ -171,6 +212,18 @@ impl Pairing {
             grant.released = true;
         }
         Ok(())
+    }
+
+    /// Host operator revoke. No phone signature. The route is local-only.
+    pub fn host_revoke(&self, target_id: &str) {
+        let mut inner = self.inner.lock().expect("pairing");
+        let Some(target) = inner.devices.get_mut(target_id) else {
+            return;
+        };
+        target.revoked = true;
+        if let Some(grant) = inner.grants.get_mut(target_id) {
+            grant.released = true;
+        }
     }
 
     pub fn open_grant(
@@ -238,7 +291,7 @@ impl Pairing {
         challenge: &str,
     ) -> Result<(), AuthError> {
         let mut inner = self.inner.lock().expect("pairing");
-        if !take_challenge(&mut inner.challenges, challenge) {
+        if !take_ticket(&mut inner, challenge) {
             return Err(AuthError::BadSignature);
         }
         let Some(device) = inner.devices.get(device_id) else {
@@ -265,6 +318,7 @@ pub enum AuthError {
     Revoked,
     TakeoverOff,
     Unpaired,
+    RateLimited,
 }
 
 pub fn unpaired_log(host: &str) -> String {
@@ -310,12 +364,54 @@ fn push_capped(items: &mut Vec<String>, item: String) {
     items.push(item);
 }
 
-fn take_challenge(challenges: &mut Vec<String>, challenge: &str) -> bool {
-    let Some(pos) = challenges.iter().position(|item| item == challenge) else {
+fn ct_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
         return false;
-    };
-    challenges.remove(pos);
-    true
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn take_token(items: &mut Vec<String>, token: &str) -> bool {
+    let mut found = None;
+    for (index, item) in items.iter().enumerate() {
+        if ct_eq(item, token) {
+            found = Some(index);
+        }
+    }
+    if let Some(index) = found {
+        items.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
+fn take_ticket(inner: &mut Inner, token: &str) -> bool {
+    let now = Instant::now();
+    let ttl = inner.challenge_ttl;
+    let mut found = None;
+    for (index, ticket) in inner.challenges.iter().enumerate() {
+        let fresh = now.saturating_duration_since(ticket.issued) <= ttl;
+        if fresh && ct_eq(&ticket.token, token) {
+            found = Some(index);
+        }
+    }
+    inner
+        .challenges
+        .retain(|ticket| now.saturating_duration_since(ticket.issued) <= ttl || found.is_some());
+    if let Some(index) = found {
+        if index < inner.challenges.len() && ct_eq(&inner.challenges[index].token, token) {
+            inner.challenges.remove(index);
+            return true;
+        }
+    }
+    false
 }
 
 fn verify(key: &VerifyingKey, message: &[u8], sig_b64: &str) -> bool {

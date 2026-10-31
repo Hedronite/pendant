@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::pairing::{self, unpaired_log, AuthError};
-use crate::session::{approve_key, scratch_socket};
+use crate::session::{approve_key, canonical_scratch};
 use crate::static_files;
 use crate::AppState;
 
@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/pair", post(pair_device))
         .route("/v1/grant", post(open_grant))
         .route("/v1/devices/{id}/revoke", post(revoke_device))
+        .route("/v1/host/revoke", post(host_revoke))
         .route("/v1/events", get(events_inbox))
         .route("/v1/events/stream", get(events_sse))
         .route("/v1/ws", get(ws_upgrade))
@@ -244,15 +245,15 @@ async fn create_worktree(
     headers: HeaderMap,
     Json(body): Json<CreateWorktree>,
 ) -> Response {
-    if !scratch_socket(state.herdr.socket_path()) {
+    let Some(herdr) = scratch_client(&state) else {
         return refuse_write();
-    }
+    };
     let canonical = serde_json::to_string(&body).unwrap_or_default();
     let message = signed_message(&headers, "POST", "/v1/worktrees", &canonical);
     if let Err(response) = gate_write(&state, &headers, &message) {
         return response;
     }
-    match state.herdr.worktree_create(&body).await {
+    match herdr.worktree_create(&body).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),
     }
@@ -290,9 +291,9 @@ async fn agent_prompt(
     headers: HeaderMap,
     Json(body): Json<PromptBody>,
 ) -> Response {
-    if !scratch_socket(state.herdr.socket_path()) {
+    let Some(herdr) = scratch_client(&state) else {
         return refuse_write();
-    }
+    };
     if body.prompt.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -305,7 +306,7 @@ async fn agent_prompt(
     if let Err(response) = gate_write(&state, &headers, &message) {
         return response;
     }
-    match state.herdr.agent_prompt(&id, &body.prompt).await {
+    match herdr.agent_prompt(&id, &body.prompt).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),
     }
@@ -317,9 +318,9 @@ async fn agent_keys(
     headers: HeaderMap,
     Json(body): Json<KeysBody>,
 ) -> Response {
-    if !scratch_socket(state.herdr.socket_path()) {
+    let Some(herdr) = scratch_client(&state) else {
         return refuse_write();
-    }
+    };
     if body.keys.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -345,7 +346,7 @@ async fn agent_keys(
         )
             .into_response();
     }
-    match state.herdr.agent_send_keys(&id, &body.keys).await {
+    match herdr.agent_send_keys(&id, &body.keys).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),
     }
@@ -362,9 +363,9 @@ async fn agent_approve(
     headers: HeaderMap,
     Json(body): Json<ApproveBody>,
 ) -> Response {
-    if !scratch_socket(state.herdr.socket_path()) {
+    let Some(herdr) = scratch_client(&state) else {
         return refuse_write();
-    }
+    };
     let path = format!("/v1/agents/{id}/approve");
     let message = signed_message(&headers, "POST", &path, body.decision.trim());
     if let Err(response) = gate_write(&state, &headers, &message) {
@@ -380,7 +381,7 @@ async fn agent_approve(
         )
             .into_response();
     }
-    match state.herdr.agent_send_keys(&id, &[decision]).await {
+    match herdr.agent_send_keys(&id, &[decision]).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => herdr_error(err),
     }
@@ -400,10 +401,16 @@ async fn pair_qr(State(state): State<AppState>, headers: HeaderMap) -> Response 
     .into_response()
 }
 
-async fn issue_challenge(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({
-        "challenge": state.pairing.issue_challenge(),
-    }))
+async fn issue_challenge(State(state): State<AppState>) -> Response {
+    match state.pairing.issue_challenge() {
+        Ok(challenge) => Json(json!({ "challenge": challenge })).into_response(),
+        Err(AuthError::RateLimited) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": {"code": "rate_limited", "message": "too many challenges"}})),
+        )
+            .into_response(),
+        Err(err) => auth_error(err),
+    }
 }
 
 #[derive(Deserialize)]
@@ -474,6 +481,28 @@ async fn revoke_device(
     }
 }
 
+#[derive(Deserialize)]
+struct HostRevokeBody {
+    device_id: String,
+}
+
+async fn host_revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HostRevokeBody>,
+) -> Response {
+    if let Err(response) = local_only(&state, &headers) {
+        return response;
+    }
+    state.pairing.host_revoke(&body.device_id);
+    Json(json!({
+        "ok": true,
+        "revoked": body.device_id,
+        "real_pairings": state.pairing.real_pairings(),
+    }))
+    .into_response()
+}
+
 fn signed_message(headers: &HeaderMap, method: &str, path: &str, canonical: &str) -> Vec<u8> {
     let device = header_value(headers, "x-pendant-device").unwrap_or("");
     let challenge = header_value(headers, "x-pendant-challenge").unwrap_or("");
@@ -519,13 +548,24 @@ fn via_serve(host: Option<&str>, serve_origin: Option<&str>) -> bool {
         || (host.eq_ignore_ascii_case(&origin.host) && (origin.port == 80 || origin.port == 443))
 }
 
+fn proxy_forwarded(headers: &HeaderMap) -> bool {
+    headers.get("forwarded").is_some() || headers.get("x-forwarded-for").is_some()
+}
+
 fn local_only(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let host = headers.get(HOST).and_then(|value| value.to_str().ok());
-    if via_serve(host, state.serve_origin.as_deref()) {
+    // A loopback Host is not enough: the proxy dials 127.0.0.1 and can forward that Host.
+    // Forwarding headers are client-visible proof the request was proxied. The TCP peer is not.
+    if proxy_forwarded(headers) || via_serve(host, state.serve_origin.as_deref()) {
         Err(forbid("local_only", "this route is only on the host"))
     } else {
         Ok(())
     }
+}
+
+fn scratch_client(state: &AppState) -> Option<pendant_herdr::HerdrClient> {
+    let path = canonical_scratch(state.herdr.socket_path())?;
+    Some(state.herdr.with_socket_path(path))
 }
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -552,6 +592,7 @@ fn auth_error(err: AuthError) -> Response {
         AuthError::Revoked => ("revoked", "device is revoked"),
         AuthError::TakeoverOff => ("takeover_off", "takeover is off"),
         AuthError::Unpaired => ("unpaired", "unpaired device"),
+        AuthError::RateLimited => ("rate_limited", "too many challenges"),
     };
     forbid(code, message)
 }
@@ -1290,6 +1331,129 @@ mod tests {
         let (status, raw) = http(port, "POST", "/v1/pair", &body).await;
         assert_eq!(status, 403);
         assert!(raw.contains("revoked"));
-        let _ = status;
+    }
+
+    #[tokio::test]
+    async fn loopback_host_with_forwarding_headers_gets_no_pairing_nonce() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&scratch).await;
+        let host = format!("127.0.0.1:{port}");
+        for extra in [
+            ("x-forwarded-for", "203.0.113.5"),
+            ("forwarded", "for=203.0.113.5"),
+        ] {
+            let (status, raw) = http_headers(port, "GET", "/v1/pair/qr", "", &host, &[extra]).await;
+            assert_eq!(status, 403);
+            assert!(raw.contains("local_only"));
+            assert!(!raw.contains("pendant-pair:v1:"));
+            let phone = pairing::TestDevice::generate("phone-x");
+            let public = phone.public_b64();
+            let nonce = "0123456789abcdef0123456789abcdef";
+            let sig = phone.sign_b64(&pairing::pair_message(&phone.id, &public, nonce));
+            let body = serde_json::json!({
+                "device_id": phone.id,
+                "public_key": public,
+                "nonce": nonce,
+                "sig": sig,
+            })
+            .to_string();
+            let (status, raw) = http(port, "POST", "/v1/pair", &body).await;
+            assert_eq!(status, 403);
+            assert!(raw.contains("bad_signature"));
+        }
+        let (status, raw) = http(port, "GET", "/v1/pair/qr", "").await;
+        assert_eq!(status, 200);
+        assert!(raw.contains("pendant-pair:v1:"));
+    }
+
+    #[tokio::test]
+    async fn host_revoke_is_refused_to_a_serve_caller() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_with(
+            &scratch,
+            pairing::Pairing::new(),
+            Some("https://serve.invalid".into()),
+        )
+        .await;
+        let phone = pair_only(port).await;
+        let body = serde_json::json!({"device_id": phone.id}).to_string();
+        let (status, raw) = http_headers(
+            port,
+            "POST",
+            "/v1/host/revoke",
+            &body,
+            "serve.invalid",
+            &[("x-forwarded-for", "203.0.113.5")],
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("local_only"));
+        let (status, raw) = http_headers(
+            port,
+            "POST",
+            "/v1/host/revoke",
+            &body,
+            &format!("127.0.0.1:{port}"),
+            &[("forwarded", "for=203.0.113.5")],
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("local_only"));
+        let (status, raw) = http(port, "POST", "/v1/host/revoke", &body).await;
+        assert_eq!(status, 200);
+        assert_eq!(response_json(&raw)["real_pairings"], 0);
+        let grant_challenge = fresh_challenge(port).await;
+        let grant_sig = phone.sign_b64(&pairing::grant_message(&phone.id, &grant_challenge));
+        let grant_body = serde_json::json!({
+            "device_id": phone.id,
+            "sig": grant_sig,
+            "challenge": grant_challenge,
+        })
+        .to_string();
+        let (status, raw) = http(port, "POST", "/v1/grant", &grant_body).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("revoked"));
+    }
+
+    #[tokio::test]
+    async fn challenge_is_rate_limited_and_expires() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let limited = serve_with(
+            &scratch,
+            pairing::Pairing::with_challenge_limit(2, std::time::Duration::from_secs(30)),
+            None,
+        )
+        .await;
+        assert_eq!(http(limited, "GET", "/v1/challenge", "").await.0, 200);
+        assert_eq!(http(limited, "GET", "/v1/challenge", "").await.0, 200);
+        let (status, raw) = http(limited, "GET", "/v1/challenge", "").await;
+        assert_eq!(status, 429);
+        assert!(raw.contains("rate_limited"));
+
+        let expiring = serve_with(
+            &scratch,
+            pairing::Pairing::with_challenge_limit(8, std::time::Duration::from_millis(30)),
+            None,
+        )
+        .await;
+        let phone = pair_only(expiring).await;
+        let stale = fresh_challenge(expiring).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let grant_sig = phone.sign_b64(&pairing::grant_message(&phone.id, &stale));
+        let grant_body = serde_json::json!({
+            "device_id": phone.id,
+            "sig": grant_sig,
+            "challenge": stale,
+        })
+        .to_string();
+        let (status, raw) = http(expiring, "POST", "/v1/grant", &grant_body).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("bad_signature"));
     }
 }

@@ -326,14 +326,20 @@ pub fn admit_watch(open: usize, already: bool, pane: &str) -> Result<(), ()> {
 
 /// Writes are allowed only for `…/.config/herdr/sessions/<name>/herdr.sock`.
 /// `.` and `..` components are refused, including after symlink resolution.
-pub fn scratch_socket(path: &std::path::Path) -> bool {
+pub fn canonical_scratch(path: &std::path::Path) -> Option<std::path::PathBuf> {
     if has_dot_components(path) {
-        return false;
+        return None;
     }
-    match std::fs::canonicalize(path) {
-        Ok(canonical) => socket_shape(&canonical),
-        Err(_) => false,
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if socket_shape(&canonical) {
+        Some(canonical)
+    } else {
+        None
     }
+}
+
+pub fn scratch_socket(path: &std::path::Path) -> bool {
+    canonical_scratch(path).is_some()
 }
 
 fn has_dot_components(path: &std::path::Path) -> bool {
@@ -467,6 +473,21 @@ mod tests {
         std::os::unix::fs::symlink(&outside, sessions.join("alias")).unwrap();
         let linked = sessions.join("alias").join("herdr.sock");
         assert!(!scratch_socket(&linked));
+    }
+
+    #[test]
+    fn canonical_scratch_follows_a_symlink_that_stays_inside_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real/.config/herdr/sessions/g1/herdr.sock");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"").unwrap();
+        let link_dir = dir.path().join("link/.config/herdr/sessions/g1");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join("herdr.sock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved = canonical_scratch(&link).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&real).unwrap());
+        assert_ne!(resolved, link);
     }
 
     #[test]
