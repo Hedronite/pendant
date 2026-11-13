@@ -552,15 +552,17 @@ fn proxy_forwarded(headers: &HeaderMap) -> bool {
     headers.get("forwarded").is_some() || headers.get("x-forwarded-for").is_some()
 }
 
-/// Rate-limit key for challenge issue. Serve writes `X-Forwarded-For` after it
-/// strips client headers, so it is the proxied caller's address; its identity
-/// headers are the fallback. A local caller that sends neither shares `local`.
+/// Rate-limit key for challenge issue. Serve appends the proxied caller to
+/// `X-Forwarded-For` after it strips client headers, so the right-most element
+/// is the trusted one; earlier elements are caller-written. The identity
+/// headers are the fallback, case-folded. A local caller that sends neither
+/// shares `local`.
 fn client_key(headers: &HeaderMap) -> String {
     if let Some(forwarded) = header_value(headers, "x-forwarded-for") {
-        if let Some(first) = forwarded.split(',').next() {
-            let first = first.trim();
-            if !first.is_empty() {
-                return normalize_client(first);
+        if let Some(trusted) = forwarded.rsplit(',').next() {
+            let trusted = trusted.trim();
+            if !trusted.is_empty() {
+                return normalize_client(trusted);
             }
         }
     }
@@ -571,7 +573,7 @@ fn client_key(headers: &HeaderMap) -> String {
         "tailscale-user-id",
     ] {
         if let Some(identity) = header_value(headers, name) {
-            return truncate_key(identity);
+            return truncate_key(&identity.to_lowercase());
         }
     }
     "local".to_string()
@@ -1593,5 +1595,82 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn challenge_rate_ignores_a_rotated_leading_forwarded_element() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let limited = serve_with(
+            &scratch,
+            pairing::Pairing::with_challenge_limit(2, std::time::Duration::from_secs(30)),
+            None,
+        )
+        .await;
+        let host = format!("127.0.0.1:{limited}");
+        // The caller writes everything to the left of the trusted hop; only the
+        // right-most element, appended by the proxy, keys the bucket.
+        for (left, port) in [("10.9.9.1", 4000), ("10.9.9.2", 4001)] {
+            let forwarded = format!("{left}, 198.51.100.7:{port}");
+            let (status, _) = http_headers(
+                limited,
+                "GET",
+                "/v1/challenge",
+                "",
+                &host,
+                &[("x-forwarded-for", forwarded.as_str())],
+            )
+            .await;
+            assert_eq!(status, 200);
+        }
+        let (status, raw) = http_headers(
+            limited,
+            "GET",
+            "/v1/challenge",
+            "",
+            &host,
+            &[("x-forwarded-for", "10.9.9.3, 198.51.100.7:4002")],
+        )
+        .await;
+        assert_eq!(status, 429);
+        assert!(raw.contains("rate_limited"));
+    }
+
+    #[tokio::test]
+    async fn challenge_rate_folds_identity_case() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let limited = serve_with(
+            &scratch,
+            pairing::Pairing::with_challenge_limit(2, std::time::Duration::from_secs(30)),
+            None,
+        )
+        .await;
+        let host = format!("127.0.0.1:{limited}");
+        for identity in ["PHONE@Example.com", "phone@example.COM"] {
+            let (status, _) = http_headers(
+                limited,
+                "GET",
+                "/v1/challenge",
+                "",
+                &host,
+                &[("tailscale-user-login", identity)],
+            )
+            .await;
+            assert_eq!(status, 200);
+        }
+        let (status, raw) = http_headers(
+            limited,
+            "GET",
+            "/v1/challenge",
+            "",
+            &host,
+            &[("tailscale-user-login", "Phone@Example.Com")],
+        )
+        .await;
+        assert_eq!(status, 429);
+        assert!(raw.contains("rate_limited"));
     }
 }
