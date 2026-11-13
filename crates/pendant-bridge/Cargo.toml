@@ -19,6 +19,7 @@ pendant-herdr = { path = "../pendant-herdr" }
 pendant-web = { path = "../pendant-web" }
 serde.workspace = true
 serde_json.workspace = true
+subtle = "2.6"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

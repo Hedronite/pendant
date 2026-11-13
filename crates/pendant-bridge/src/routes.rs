@@ -401,8 +401,8 @@ async fn pair_qr(State(state): State<AppState>, headers: HeaderMap) -> Response 
     .into_response()
 }
 
-async fn issue_challenge(State(state): State<AppState>) -> Response {
-    match state.pairing.issue_challenge() {
+async fn issue_challenge(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match state.pairing.issue_challenge(&client_key(&headers)) {
         Ok(challenge) => Json(json!({ "challenge": challenge })).into_response(),
         Err(AuthError::RateLimited) => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -550,6 +550,43 @@ fn via_serve(host: Option<&str>, serve_origin: Option<&str>) -> bool {
 
 fn proxy_forwarded(headers: &HeaderMap) -> bool {
     headers.get("forwarded").is_some() || headers.get("x-forwarded-for").is_some()
+}
+
+/// Rate-limit key for challenge issue. Serve writes `X-Forwarded-For` after it
+/// strips client headers, so it is the proxied caller's address; its identity
+/// headers are the fallback. A local caller that sends neither shares `local`.
+fn client_key(headers: &HeaderMap) -> String {
+    if let Some(forwarded) = header_value(headers, "x-forwarded-for") {
+        if let Some(first) = forwarded.split(',').next() {
+            let first = first.trim();
+            if !first.is_empty() {
+                return normalize_client(first);
+            }
+        }
+    }
+    for name in [
+        "tailscale-user-login",
+        "tailscale-user-name",
+        "tailscale-user-profile",
+        "tailscale-user-id",
+    ] {
+        if let Some(identity) = header_value(headers, name) {
+            return truncate_key(identity);
+        }
+    }
+    "local".to_string()
+}
+
+/// Serve supplies `host:port`; the port changes per connection, so drop it.
+fn normalize_client(value: &str) -> String {
+    if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
+        return addr.ip().to_string();
+    }
+    truncate_key(value)
+}
+
+fn truncate_key(value: &str) -> String {
+    value.chars().take(64).collect()
 }
 
 fn local_only(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -1455,5 +1492,106 @@ mod tests {
         let (status, raw) = http(expiring, "POST", "/v1/grant", &grant_body).await;
         assert_eq!(status, 403);
         assert!(raw.contains("bad_signature"));
+    }
+
+    #[tokio::test]
+    async fn a_challenge_replay_is_refused_and_leaves_state_alone() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let port = serve_on(&scratch).await;
+        let phone = enroll(port).await;
+        let challenge = fresh_challenge(port).await;
+        let sig = phone.sign_b64(&pairing::grant_message(&phone.id, &challenge));
+        let grant_body = serde_json::json!({
+            "device_id": phone.id,
+            "sig": sig,
+            "challenge": challenge,
+        })
+        .to_string();
+        let (status, _) = http(port, "POST", "/v1/grant", &grant_body).await;
+        assert_eq!(status, 200);
+        let (status, raw) = http(port, "POST", "/v1/grant", &grant_body).await;
+        assert_eq!(status, 403);
+        assert!(raw.contains("bad_signature"));
+        // The refused replay released no grant and dropped no device: a signed
+        // write on the grant opened above still passes.
+        let (status, raw) = signed(
+            port,
+            &phone,
+            "POST",
+            "/v1/agents/w1:p1/prompt",
+            "hello",
+            r#"{"prompt":"hello"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{raw}");
+    }
+
+    #[tokio::test]
+    async fn challenge_rate_is_per_client_not_global() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = dir.path().join(".config/herdr/sessions/g1/herdr.sock");
+        spawn_mock(&scratch, Arc::new(Mutex::new(Vec::new())));
+        let limited = serve_with(
+            &scratch,
+            pairing::Pairing::with_challenge_limit(2, std::time::Duration::from_secs(30)),
+            None,
+        )
+        .await;
+        let host = format!("127.0.0.1:{limited}");
+        // Same address, different connection ports: one client key.
+        let (status, _) = http_headers(
+            limited,
+            "GET",
+            "/v1/challenge",
+            "",
+            &host,
+            &[("x-forwarded-for", "198.51.100.7:4001")],
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, _) = http_headers(
+            limited,
+            "GET",
+            "/v1/challenge",
+            "",
+            &host,
+            &[("x-forwarded-for", "198.51.100.7:4002")],
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, raw) = http_headers(
+            limited,
+            "GET",
+            "/v1/challenge",
+            "",
+            &host,
+            &[("x-forwarded-for", "198.51.100.7:4003")],
+        )
+        .await;
+        assert_eq!(status, 429);
+        assert!(raw.contains("rate_limited"));
+        // Another client key still gets a challenge in the same window.
+        let (status, _) = http_headers(
+            limited,
+            "GET",
+            "/v1/challenge",
+            "",
+            &host,
+            &[("x-forwarded-for", "198.51.100.8:4004")],
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, _) = http_headers(
+            limited,
+            "GET",
+            "/v1/challenge",
+            "",
+            &host,
+            &[("tailscale-user-login", "phone@example.com")],
+        )
+        .await;
+        assert_eq!(status, 200);
     }
 }
