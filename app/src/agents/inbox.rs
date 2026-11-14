@@ -22,12 +22,10 @@ pub fn inbox(nav: Nav) -> Screen {
                 .flex_1()
                 .flex_col()
                 .bg(rgb(theme::GRAPHITE))
-                .child(
-                    when(
-                        move || live.error.get().is_some(),
-                        move || error_line(move || live.error.get().unwrap_or_default().into()),
-                    ),
-                )
+                .child(when(
+                    move || live.error.get().is_some(),
+                    move || error_line(move || live.error.get().unwrap_or_default().into()),
+                ))
                 .child(
                     virtual_list(
                         move || live.inbox.with(Vec::len),
@@ -40,9 +38,9 @@ pub fn inbox(nav: Nav) -> Screen {
                                 .px_4()
                                 .py_2()
                                 .on_press(move || {
-                                    let id = live
-                                        .inbox
-                                        .with(|items| items.get(at.index()).map(|item| item.id.clone()));
+                                    let id = live.inbox.with(|items| {
+                                        items.get(at.index()).map(|item| item.id.clone())
+                                    });
                                     if let Some(id) = id {
                                         nav.push(Route::Agent(id));
                                     }
@@ -51,9 +49,7 @@ pub fn inbox(nav: Nav) -> Screen {
                                     // The agent the event is about.
                                     text(move || {
                                         live.inbox
-                                            .with(|items| {
-                                                items.get(at.index()).map(event_label)
-                                            })
+                                            .with(|items| items.get(at.index()).map(event_label))
                                             .unwrap_or_default()
                                     })
                                     .text_size(px(16.0))
@@ -73,8 +69,9 @@ pub fn inbox(nav: Nav) -> Screen {
                     )
                     .estimated_item_size(px(64.0))
                     .keys(move || {
-                        live.inbox
-                            .with(|items| items.iter().map(|item| item.id.clone()).collect::<Vec<_>>())
+                        live.inbox.with(|items| {
+                            items.iter().map(|item| item.id.clone()).collect::<Vec<_>>()
+                        })
                     })
                     .separator(move || view().h(px(1.0)).mx_4().bg(rgb(theme::LINE)))
                     .empty(

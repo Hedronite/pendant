@@ -63,47 +63,39 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                 .flex_col()
                 .bg(rgb(theme::GRAPHITE))
                 .child(link_bar(live))
-                .child(
-                    when(
-                        move || live.error.get().is_some(),
-                        move || error_line(move || live.error.get().unwrap_or_default().into()),
-                    ),
-                )
-                .child(
-                    when(
-                        move || output.error().is_some(),
-                        move || {
-                            error_note(
-                                move || {
-                                    output
-                                        .error()
-                                        .map(|err| err.to_owned())
-                                        .unwrap_or_default()
-                                        .into()
-                                },
-                                move || output.refetch(),
-                            )
-                        },
-                    ),
-                )
-                .child(
-                    when(
-                        move || live.snapshot.get().is_some(),
-                        move || detail_body(live, body_id.clone().into(), output),
-                    ),
-                )
-                .child(
-                    when(
-                        move || live.snapshot.get().is_none() && live.error.get().is_none(),
-                        || {
-                            view().flex_1().items_center().justify_center().child(
-                                text("Loading…")
-                                    .text_size(px(15.0))
-                                    .text_color(rgb(theme::DIM)),
-                            )
-                        },
-                    ),
-                ),
+                .child(when(
+                    move || live.error.get().is_some(),
+                    move || error_line(move || live.error.get().unwrap_or_default().into()),
+                ))
+                .child(when(
+                    move || output.error().is_some(),
+                    move || {
+                        error_note(
+                            move || {
+                                output
+                                    .error()
+                                    .map(|err| err.to_owned())
+                                    .unwrap_or_default()
+                                    .into()
+                            },
+                            move || output.refetch(),
+                        )
+                    },
+                ))
+                .child(when(
+                    move || live.snapshot.get().is_some(),
+                    move || detail_body(live, body_id.clone().into(), output),
+                ))
+                .child(when(
+                    move || live.snapshot.get().is_none() && live.error.get().is_none(),
+                    || {
+                        view().flex_1().items_center().justify_center().child(
+                            text("Loading…")
+                                .text_size(px(15.0))
+                                .text_color(rgb(theme::DIM)),
+                        )
+                    },
+                )),
         )
 }
 
@@ -147,7 +139,11 @@ fn link_bar(live: Live) -> impl IntoElement {
 /// Status and identity from the snapshot, then the pane feed and the
 /// fetched output. One owned id per reactive closure: `SharedString` is an
 /// `Arc`, so the clones are cheap.
-fn detail_body(live: Live, id: SharedString, output: Resource<AgentDetail, String>) -> impl IntoElement {
+fn detail_body(
+    live: Live,
+    id: SharedString,
+    output: Resource<AgentDetail, String>,
+) -> impl IntoElement {
     let id_label = id.clone();
     let id_status = id.clone();
     let id_meta = id.clone();
@@ -204,10 +200,7 @@ fn detail_body(live: Live, id: SharedString, output: Resource<AgentDetail, Strin
                             snap.as_ref()
                                 .and_then(|snap| snap.agent(&id_meta))
                                 .map(|agent| {
-                                    agent
-                                        .agent
-                                        .clone()
-                                        .unwrap_or_else(|| "agent".to_owned())
+                                    agent.agent.clone().unwrap_or_else(|| "agent".to_owned())
                                 })
                         }) {
                             Some(harness) => harness,
@@ -221,46 +214,42 @@ fn detail_body(live: Live, id: SharedString, output: Resource<AgentDetail, Strin
         .child(
             // The watched pane's frames, and what the watch sent first.
             view().p_4().pb_2().flex_col().gap_2().child(
-                text(move || {
-                    match feed(live, &id_feed) {
-                        Some(feed) => format!(
-                            "frames {} · seq {} · out of order {}",
-                            feed.seq.frames,
-                            feed.seq
-                                .last()
-                                .map(|seq| seq.to_string())
-                                .unwrap_or_else(|| "-".to_owned()),
-                            feed.seq.out_of_order
-                        ),
-                        None => "Not watching the pane yet.".to_owned(),
-                    }
+                text(move || match feed(live, &id_feed) {
+                    Some(feed) => format!(
+                        "frames {} · seq {} · out of order {}",
+                        feed.seq.frames,
+                        feed.seq
+                            .last()
+                            .map(|seq| seq.to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                        feed.seq.out_of_order
+                    ),
+                    None => "Not watching the pane yet.".to_owned(),
                 })
                 .text_size(px(12.0))
                 .text_color(rgb(theme::DIM)),
             ),
         )
-        .child(
-            when(
-                move || {
-                    feed(live, &id_refused)
-                        .and_then(|feed| feed.refused.clone())
-                        .is_some()
-                },
-                move || {
-                    let id = id_refused_text.clone();
-                    text(move || {
-                        format!(
-                            "The bridge refused: {}",
-                            feed(live, &id)
-                                .and_then(|feed| feed.refused.clone())
-                                .unwrap_or_default()
-                        )
-                    })
-                    .text_size(px(12.0))
-                    .text_color(rgb(theme::GOLD))
-                },
-            ),
-        )
+        .child(when(
+            move || {
+                feed(live, &id_refused)
+                    .and_then(|feed| feed.refused.clone())
+                    .is_some()
+            },
+            move || {
+                let id = id_refused_text.clone();
+                text(move || {
+                    format!(
+                        "The bridge refused: {}",
+                        feed(live, &id)
+                            .and_then(|feed| feed.refused.clone())
+                            .unwrap_or_default()
+                    )
+                })
+                .text_size(px(12.0))
+                .text_color(rgb(theme::GOLD))
+            },
+        ))
         .child(
             // herdr's recent lines for this pane: the watch's scrollback
             // first, the fetched output behind it.
@@ -305,12 +294,10 @@ fn detail_body(live: Live, id: SharedString, output: Resource<AgentDetail, Strin
 /// The pane feed for this agent, if the pane is known and watched. Reads
 /// through the signals, so it tracks the caller's reactive scope.
 fn feed(live: Live, id: &str) -> Option<PaneFeed> {
-    let pane = live
-        .snapshot
-        .with(|snap| {
-            snap.as_ref()
-                .and_then(|snap| snap.agent(id))
-                .map(|agent| agent.pane_id.clone())
-        })?;
+    let pane = live.snapshot.with(|snap| {
+        snap.as_ref()
+            .and_then(|snap| snap.agent(id))
+            .map(|agent| agent.pane_id.clone())
+    })?;
     live.panes.with(|panes| panes.get(&pane).cloned())
 }

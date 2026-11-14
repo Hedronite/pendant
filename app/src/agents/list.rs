@@ -71,19 +71,10 @@ pub fn list(nav: Nav) -> Screen {
                         )
                         .child(open_inbox(nav)),
                 )
-                .child(
-                    when(
-                        move || live.error.get().is_some(),
-                        move || {
-                            error_line(move || {
-                                live.error
-                                    .get()
-                                    .unwrap_or_default()
-                                    .into()
-                            })
-                        },
-                    ),
-                )
+                .child(when(
+                    move || live.error.get().is_some(),
+                    move || error_line(move || live.error.get().unwrap_or_default().into()),
+                ))
                 .child(
                     virtual_list(
                         move || {
@@ -98,13 +89,11 @@ pub fn list(nav: Nav) -> Screen {
                                 .gap_3()
                                 .px_4()
                                 .on_press(move || {
-                                    let id = live
-                                        .snapshot
-                                        .with(|snap| {
-                                            snap.as_ref()
-                                                .and_then(|snap| snap.agents.get(at.index()).cloned())
-                                                .map(|agent| agent.id.clone())
-                                        });
+                                    let id = live.snapshot.with(|snap| {
+                                        snap.as_ref()
+                                            .and_then(|snap| snap.agents.get(at.index()).cloned())
+                                            .map(|agent| agent.id.clone())
+                                    });
                                     if let Some(id) = id {
                                         nav.push(Route::Agent(id));
                                     }
@@ -114,7 +103,9 @@ pub fn list(nav: Nav) -> Screen {
                                         live.snapshot
                                             .with(|snap| {
                                                 snap.as_ref()
-                                                    .and_then(|snap| snap.agents.get(at.index()).cloned())
+                                                    .and_then(|snap| {
+                                                        snap.agents.get(at.index()).cloned()
+                                                    })
                                                     .map(|agent| agent.label().to_owned())
                                             })
                                             .unwrap_or_default()
@@ -127,7 +118,9 @@ pub fn list(nav: Nav) -> Screen {
                                     live.snapshot
                                         .with(|snap| {
                                             snap.as_ref()
-                                                .and_then(|snap| snap.agents.get(at.index()).cloned())
+                                                .and_then(|snap| {
+                                                    snap.agents.get(at.index()).cloned()
+                                                })
                                                 .map(|agent| agent.status.clone())
                                         })
                                         .unwrap_or_default()
@@ -137,14 +130,16 @@ pub fn list(nav: Nav) -> Screen {
                     )
                     .estimated_item_size(px(56.0))
                     .keys(move || {
-                        live.snapshot
-                            .with(|snap| {
-                                snap.as_ref()
-                                    .map(|snap| {
-                                        snap.agents.iter().map(|agent| agent.id.clone()).collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default()
-                            })
+                        live.snapshot.with(|snap| {
+                            snap.as_ref()
+                                .map(|snap| {
+                                    snap.agents
+                                        .iter()
+                                        .map(|agent| agent.id.clone())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        })
                     })
                     .separator(move || view().h(px(1.0)).mx_4().bg(rgb(theme::LINE)))
                     .empty(

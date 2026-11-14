@@ -67,11 +67,9 @@ pub(crate) fn status_pill(status: impl Fn() -> SharedString + Clone + 'static) -
 /// What a failed shared fetch shows. The live link retries itself every
 /// [`crate::net::live::POLL`], so this is the error text only.
 pub(crate) fn error_line(error: impl Fn() -> SharedString + Copy + 'static) -> impl IntoElement {
-    view().p_4().child(
-        text(error)
-            .text_size(px(13.0))
-            .text_color(rgb(theme::DIM)),
-    )
+    view()
+        .p_4()
+        .child(text(error).text_size(px(13.0)).text_color(rgb(theme::DIM)))
 }
 
 /// What a failed load shows: the error, and Retry, which refetches.
@@ -84,11 +82,7 @@ pub(crate) fn error_note(
         .items_center()
         .gap_2()
         .p_4()
-        .child(
-            text(error)
-                .text_size(px(13.0))
-                .text_color(rgb(theme::DIM)),
-        )
+        .child(text(error).text_size(px(13.0)).text_color(rgb(theme::DIM)))
         .child(
             text("Retry")
                 .text_size(px(15.0))
@@ -101,7 +95,9 @@ pub(crate) fn error_note(
 
 /// The link state one line, for the bottom of a page's header slot and the
 /// top of a page's content: what the WebSocket is doing right now.
-pub(crate) fn link_line(link: impl Fn() -> crate::net::live::Link + Copy + 'static) -> impl IntoElement {
+pub(crate) fn link_line(
+    link: impl Fn() -> crate::net::live::Link + Copy + 'static,
+) -> impl IntoElement {
     view()
         .flex_row()
         .items_center()
@@ -150,18 +146,16 @@ pub(crate) fn page_header(title: &'static str, nav: Nav) -> impl IntoElement {
         .border_color(rgb(theme::LINE))
         .bg(rgb(theme::SURFACE))
         .px_4()
-        .child(
-            when(
-                move || nav.depth() > 1,
-                move || {
-                    text("Back")
-                        .text_size(px(15.0))
-                        .text_color(rgb(theme::TEAL))
-                        .on_press(move || nav.back())
-                        .role(AccessibilityRole::Button)
-                },
-            ),
-        )
+        .child(when(
+            move || nav.depth() > 1,
+            move || {
+                text("Back")
+                    .text_size(px(15.0))
+                    .text_color(rgb(theme::TEAL))
+                    .on_press(move || nav.back())
+                    .role(AccessibilityRole::Button)
+            },
+        ))
         .child(
             text(title)
                 .text_size(px(17.0))
