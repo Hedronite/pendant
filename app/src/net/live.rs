@@ -98,6 +98,11 @@ enum Event {
 thread_local! {
     /// The worker's command channel, owned by the engine thread.
     static COMMANDS: RefCell<Option<Sender<Cmd>>> = const { RefCell::new(None) };
+    /// The root's owner, where [`Live::spawn_detached`] runs tasks.
+    static ROOT: RefCell<Option<Owner>> = const { RefCell::new(None) };
+    /// Detached tasks still running, by id; each removes itself when done.
+    static DETACHED: RefCell<Vec<(u64, Spawned<()>)>> = const { RefCell::new(Vec::new()) };
+    static NEXT_DETACHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Live {
@@ -118,6 +123,15 @@ impl Live {
         self.panes.update(|panes| {
             panes.remove(pane);
         });
+    }
+
+    /// Runs `future` to its end under the app's root, not the caller's
+    /// page: leaving the page does not cancel it. Its task handle is kept
+    /// until it finishes (dropping an nsh task handle cancels the task).
+    /// For a write the person started: check the page is still there before
+    /// touching its signals.
+    pub fn spawn_detached(&self, future: impl std::future::Future<Output = ()> + 'static) {
+        spawn_detached(future);
     }
 
     /// Blocked items in the inbox.
@@ -260,6 +274,24 @@ fn outcome<T>(result: &Result<T, WriteError>) -> String {
     }
 }
 
+/// [`Live::spawn_detached`] without a `Live` at hand (an event handler).
+pub fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static) {
+    let id = NEXT_DETACHED.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    });
+    let run = async move {
+        future.await;
+        DETACHED.with(|tasks| tasks.borrow_mut().retain(|(task, _)| *task != id));
+    };
+    let spawned = ROOT.with(|root| match root.borrow().as_ref() {
+        Some(owner) => owner.run(|| spawn(run)),
+        None => spawn(run),
+    });
+    DETACHED.with(|tasks| tasks.borrow_mut().push((id, spawned)));
+}
+
 fn command(cmd: Cmd) {
     COMMANDS.with(|commands| {
         if let Some(tx) = commands.borrow().as_ref() {
@@ -292,6 +324,7 @@ pub fn start() -> Live {
         grant_until: signal(None),
     };
     provide_context(live);
+    ROOT.with(|root| *root.borrow_mut() = Some(Owner::current()));
     let bridge = match crate::bridge() {
         Ok(bridge) => bridge,
         Err(err) => {
