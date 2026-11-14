@@ -121,6 +121,8 @@ pub async fn remembered() -> Result<FolderReport, FolderError> {
 
 /// Where kept access is written: a small file in the app's data directory
 /// (an iOS bookmark, or an Android tree URI). Not a secret.
+/// Call it on the engine thread: nsh's `data_dir` panics outside its own
+/// context (a UIKit delegate on the main thread, a worker thread).
 #[cfg(any(target_os = "ios", target_os = "android"))]
 fn kept_file() -> Option<std::path::PathBuf> {
     nsh_core::prelude::data_dir().map(|dir| dir.join("d1-folder"))
@@ -218,6 +220,7 @@ mod tests {
     }
 
     /// Polls a future that is ready at once (the host stubs are).
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     fn futures_block<F: std::future::Future>(future: F) -> F::Output {
         use std::task::{Context, Poll, Waker};
         let mut cx = Context::from_waker(Waker::noop());

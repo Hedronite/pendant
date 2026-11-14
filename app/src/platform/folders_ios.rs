@@ -8,6 +8,7 @@
 //! again security-scoped.
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
 use objc2::rc::Retained;
@@ -29,6 +30,10 @@ type Outcome = Result<FolderReport, FolderError>;
 
 struct Ivars {
     reply: RefCell<Option<Sender<Outcome>>>,
+    /// Where the bookmark goes. Resolved on the engine thread before the
+    /// picker opens: nsh's `data_dir` panics outside its own context, and
+    /// the delegate runs on UIKit's main thread.
+    keep: Option<PathBuf>,
 }
 
 define_class!(
@@ -44,7 +49,7 @@ define_class!(
         #[unsafe(method(documentPicker:didPickDocumentsAtURLs:))]
         fn did_pick(&self, _picker: &UIDocumentPickerViewController, urls: &NSArray<NSURL>) {
             let outcome = match urls.firstObject() {
-                Some(url) => look(&url, true),
+                Some(url) => look(&url, self.ivars().keep.as_deref()),
                 None => Err(FolderError::Cancelled),
             };
             self.answer(outcome);
@@ -58,9 +63,10 @@ define_class!(
 );
 
 impl Delegate {
-    fn new(mtm: MainThreadMarker, reply: Sender<Outcome>) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, reply: Sender<Outcome>, keep: Option<PathBuf>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Ivars {
             reply: RefCell::new(Some(reply)),
+            keep,
         });
         // SAFETY: NSObject's init on a freshly allocated instance.
         unsafe { msg_send![super(this), init] }
@@ -82,8 +88,8 @@ thread_local! {
 }
 
 /// Counts the folder at `url` inside its security scope. With `keep`, a
-/// bookmark is written for [`remembered`](super::remembered).
-fn look(url: &NSURL, keep: bool) -> Outcome {
+/// bookmark is written to that file for [`remembered`](super::remembered).
+fn look(url: &NSURL, keep: Option<&Path>) -> Outcome {
     // SAFETY: a live file URL from the picker or a resolved bookmark.
     let scoped = unsafe { url.startAccessingSecurityScopedResource() };
     let outcome = (|| {
@@ -92,8 +98,8 @@ fn look(url: &NSURL, keep: bool) -> Outcome {
             .ok_or_else(|| FolderError::Platform("the picked URL has no path".into()))?;
         let mut report = count_tree(std::path::Path::new(&path.to_string()))
             .map_err(|err| FolderError::Platform(err.kind().to_string()))?;
-        if keep {
-            report.persisted = keep_bookmark(url).is_ok();
+        if let Some(file) = keep {
+            report.persisted = keep_bookmark(url, file).is_ok();
         }
         Ok(report)
     })();
@@ -104,7 +110,7 @@ fn look(url: &NSURL, keep: bool) -> Outcome {
     outcome
 }
 
-fn keep_bookmark(url: &NSURL) -> Result<(), FolderError> {
+fn keep_bookmark(url: &NSURL, file: &Path) -> Result<(), FolderError> {
     let data = url
         .bookmarkDataWithOptions_includingResourceValuesForKeys_relativeToURL_error(
             NSURLBookmarkCreationOptions(0),
@@ -112,13 +118,11 @@ fn keep_bookmark(url: &NSURL) -> Result<(), FolderError> {
             None,
         )
         .map_err(|err| FolderError::Platform(err.localizedDescription().to_string()))?;
-    let file = kept_file().ok_or(FolderError::Platform("no data directory".into()))?;
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|err| FolderError::Platform(err.kind().to_string()))?;
     }
-    std::fs::write(&file, data.to_vec())
-        .map_err(|err| FolderError::Platform(err.kind().to_string()))
+    std::fs::write(file, data.to_vec()).map_err(|err| FolderError::Platform(err.kind().to_string()))
 }
 
 /// The view controller to present from: the key window's root, then down
@@ -139,6 +143,7 @@ fn presenter(mtm: MainThreadMarker) -> Option<Retained<UIViewController>> {
 }
 
 pub(super) async fn pick() -> Outcome {
+    let keep = kept_file();
     let (reply, answer) = mpsc::channel::<Outcome>();
     let shown = nsh_core::prelude::run_on_main_thread(move || {
         let Some(mtm) = MainThreadMarker::new() else {
@@ -154,7 +159,7 @@ pub(super) async fn pick() -> Outcome {
             &types,
         );
         picker.setAllowsMultipleSelection(false);
-        let delegate = Delegate::new(mtm, reply);
+        let delegate = Delegate::new(mtm, reply, keep);
         picker.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         PENDING.with(|pending| *pending.borrow_mut() = Some(delegate));
         presenter.presentViewController_animated_completion(&picker, true, None);
@@ -168,7 +173,7 @@ pub(super) async fn pick() -> Outcome {
 
 pub(super) async fn remembered() -> Outcome {
     let file = kept_file().ok_or(FolderError::NothingKept)?;
-    let bytes = std::fs::read(file).map_err(|_| FolderError::NothingKept)?;
+    let bytes = std::fs::read(&file).map_err(|_| FolderError::NothingKept)?;
     let (reply, answer) = mpsc::channel::<Outcome>();
     let _ = nsh_core::prelude::run_on_main_thread(move || {
         let data = NSData::with_bytes(&bytes);
@@ -183,11 +188,14 @@ pub(super) async fn remembered() -> Outcome {
             )
         };
         let outcome = match url {
-            Ok(url) => look(&url, stale.as_bool()).map(|report| FolderReport {
-                persisted: true,
-                restored: true,
-                ..report
-            }),
+            // A stale bookmark is renewed in place.
+            Ok(url) => {
+                look(&url, stale.as_bool().then_some(file.as_path())).map(|report| FolderReport {
+                    persisted: true,
+                    restored: true,
+                    ..report
+                })
+            }
             Err(_) => Err(FolderError::NothingKept),
         };
         let _ = reply.send(outcome);
