@@ -3,8 +3,9 @@
 use nsh_base::nav_page;
 use nsh_core::prelude::*;
 
-use crate::agents::{error_line, link_line, status_pill};
+use crate::agents::{error_line, link_line, status_pill, unpaired_banner};
 use crate::net::live::live;
+use crate::net::pair::PairState;
 use crate::theme;
 use crate::{Nav, Route};
 
@@ -49,6 +50,10 @@ pub fn list(nav: Nav) -> Screen {
                 .flex_col()
                 .bg(rgb(theme::GRAPHITE))
                 .child(link_line(move || live.link.get()))
+                .child(when(
+                    move || matches!(live.pairing.get(), PairState::Unpaired { .. }),
+                    move || unpaired_banner(nav),
+                ))
                 .child(
                     view()
                         .flex_row()

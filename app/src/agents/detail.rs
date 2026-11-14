@@ -1,14 +1,21 @@
-//! One agent: its status, herdr's recent output, and the pane frames the
-//! live link watches for it.
+//! One agent: its status, herdr's recent output, the pane frames the live
+//! link watches for it, and the writes it takes.
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::rc::Rc;
 
+use nsh_base::alert_dialog;
 use nsh_base::nav_page;
+use nsh_core::element::input;
 use nsh_core::prelude::*;
 
-use crate::agents::{error_line, error_note, page_header, status_pill};
+use crate::agents::{
+    error_line, error_note, page_header, status_pill, unpaired_banner, write_button, write_note,
+    ButtonKind,
+};
 use crate::net::live::{live, Live, PaneFeed};
+use crate::net::pair::{PairState, WorktreeRequest, WriteError};
 use crate::net::types::AgentDetail;
 use crate::theme;
 use crate::Nav;
@@ -63,7 +70,107 @@ pub fn detail(nav: Nav, id: String) -> Screen {
         }
     });
 
+    // The write controls. One `busy` at a time: a second biometric prompt
+    // does not stack on the first.
+    let busy = signal(false);
+    let write_error = signal(None::<WriteError>);
+    let draft = signal(String::new());
+    let made = signal(None::<String>);
+
+    let paired = move || matches!(live.pairing.get(), PairState::Paired { .. });
+    let enabled = move || !busy.get() && paired();
+
+    let prompt_id = id.clone();
+    let on_prompt = move || {
+        let text = draft.get().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let live = live;
+        let id = prompt_id.clone();
+        spawn(async move {
+            busy.set(true);
+            error_set(&write_error, None);
+            let result = with_grant(live, || live.prompt(&id, &text)).await;
+            busy.set(false);
+            match result {
+                Ok(()) => draft.set(String::new()),
+                Err(err) => error_set(&write_error, Some(err)),
+            }
+        });
+    };
+
+    let approve_id = id.clone();
+    let on_approve = move || {
+        let live = live;
+        let id = approve_id.clone();
+        spawn(async move {
+            busy.set(true);
+            error_set(&write_error, None);
+            let result = with_grant(live, || live.approve(&id)).await;
+            busy.set(false);
+            if let Err(err) = result {
+                error_set(&write_error, Some(err));
+            }
+        });
+    };
+
+    let deny_id = id.clone();
+    let on_deny = move || {
+        let answer = alert_dialog()
+            .title("Deny the agent?")
+            .description("The agent's waiting request is refused.")
+            .cancel("cancel", "Cancel")
+            .destructive("deny", "Deny")
+            .show();
+        let live = live;
+        let id = deny_id.clone();
+        spawn(async move {
+            if answer
+                .await
+                .is_ok_and(|r| r.action.as_deref() == Some("deny"))
+            {
+                busy.set(true);
+                error_set(&write_error, None);
+                let result = with_grant(live, || live.deny(&id)).await;
+                busy.set(false);
+                if let Err(err) = result {
+                    error_set(&write_error, Some(err));
+                }
+            }
+        });
+    };
+
+    let worktree_id = id.clone();
+    let on_worktree = move || {
+        let live = live;
+        let id = worktree_id.clone();
+        spawn(async move {
+            busy.set(true);
+            error_set(&write_error, None);
+            let request = live.snapshot.with_untracked(|snap| {
+                snap.as_ref()
+                    .and_then(|snap| snap.agent(&id))
+                    .map(|agent| WorktreeRequest {
+                        workspace_id: Some(agent.workspace_id.clone()),
+                        ..Default::default()
+                    })
+            });
+            let Some(request) = request else {
+                busy.set(false);
+                return;
+            };
+            let result = with_grant(live, || live.worktree_create(&request)).await;
+            busy.set(false);
+            match result {
+                Ok(_) => made.set(Some("Worktree created.".to_owned())),
+                Err(err) => error_set(&write_error, Some(err)),
+            }
+        });
+    };
+
     let body_id = id.clone();
+    let write_id = id.clone();
     nav_page()
         .title(id)
         .header(page_header("Agent", nav))
@@ -93,8 +200,45 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                     },
                 ))
                 .child(when(
+                    move || matches!(live.pairing.get(), PairState::Unpaired { .. }),
+                    move || unpaired_banner(nav),
+                ))
+                .child(when(
                     move || live.snapshot.get().is_some(),
-                    move || detail_body(live, body_id.clone().into(), output),
+                    move || {
+                        // The branch runs again on every flip, so each run
+                        // gets its own copies of the handlers.
+                        let body_id = body_id.clone();
+                        let write_id = write_id.clone();
+                        let enabled = enabled.clone();
+                        let on_prompt = on_prompt.clone();
+                        let on_approve = on_approve.clone();
+                        let on_deny = on_deny.clone();
+                        let on_worktree = on_worktree.clone();
+                        view()
+                            .flex_1()
+                            .flex_col()
+                            .child(detail_body(live, body_id.into(), output))
+                            .child(write_section(
+                                live,
+                                draft,
+                                made,
+                                write_error,
+                                enabled,
+                                on_prompt,
+                                on_worktree,
+                            ))
+                            .child(when(
+                                move || blocked(live, &write_id) && paired(),
+                                move || {
+                                    decision_bar(
+                                        enabled.clone(),
+                                        on_approve.clone(),
+                                        on_deny.clone(),
+                                    )
+                                },
+                            ))
+                    },
                 ))
                 .child(when(
                     move || live.snapshot.get().is_none() && live.error.get().is_none(),
@@ -163,7 +307,6 @@ fn detail_body(
     let id_output = id.clone();
 
     view()
-        .flex_1()
         .flex_col()
         .child(
             // Status and identity.
@@ -299,6 +442,131 @@ fn detail_body(
                         ),
                 ),
         )
+}
+
+/// Writes run with a grant open: with none, the grant's own biometric runs
+/// first, so a write does not dead-end on `GrantRequired`. The write's
+/// future is made after the grant opens, so its borrows stay in scope.
+async fn with_grant<T, F: Future<Output = Result<T, WriteError>>>(
+    live: Live,
+    run: impl FnOnce() -> F,
+) -> Result<T, WriteError> {
+    if !live.grant_open() {
+        live.open_grant().await?;
+    }
+    run().await
+}
+
+/// Sets the write error from a task.
+fn error_set(error: &Signal<Option<WriteError>>, value: Option<WriteError>) {
+    error.set(value);
+}
+
+/// Whether the agent is waiting on the user right now.
+fn blocked(live: Live, id: &str) -> bool {
+    live.snapshot
+        .with(|snap| {
+            snap.as_ref()
+                .and_then(|snap| snap.agent(id))
+                .map(|agent| agent.is_blocked())
+        })
+        .unwrap_or(false)
+}
+
+/// The write controls: the grant state, the prompt input, the worktree
+/// action, and the last write's error.
+fn write_section(
+    live: Live,
+    draft: Signal<String>,
+    made: Signal<Option<String>>,
+    error: Signal<Option<WriteError>>,
+    enabled: impl Fn() -> bool + Clone + 'static,
+    on_prompt: impl Fn() + Clone + 'static,
+    on_worktree: impl Fn() + Clone + 'static,
+) -> impl IntoElement {
+    let enabled_send = enabled.clone();
+    let enabled_wt = enabled;
+    view()
+        .flex_col()
+        .gap_3()
+        .p_4()
+        .pt_3()
+        .child(
+            text(move || {
+                if live.grant_open() {
+                    "grant open".to_owned()
+                } else {
+                    "grant closed — the next write opens one".to_owned()
+                }
+            })
+            .text_size(px(12.0))
+            .text_color(rgb(theme::DIM)),
+        )
+        .child(when(
+            move || made.get().is_some(),
+            move || {
+                text(move || made.get().unwrap_or_default())
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme::TEAL))
+            },
+        ))
+        .child(
+            input()
+                .value(move || draft.get())
+                .placeholder("Prompt the agent…")
+                .multiline(true)
+                .on_change(move |text: &str| draft.set(text.to_owned()))
+                .text_size(px(14.0))
+                .text_color(rgb(theme::TEXT)),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_3()
+                .child(view().flex_1().child(write_button(
+                    "Send prompt",
+                    move || enabled_send() && !draft.get().trim().is_empty(),
+                    on_prompt,
+                    ButtonKind::Primary,
+                )))
+                .child(view().flex_1().child(write_button(
+                    "New worktree",
+                    enabled_wt,
+                    on_worktree,
+                    ButtonKind::Quiet,
+                ))),
+        )
+        .child(write_note(move || error.get()))
+}
+
+/// The bar pinned under the output while the agent is blocked.
+fn decision_bar(
+    enabled: impl Fn() -> bool + Clone + 'static,
+    on_approve: impl Fn() + Clone + 'static,
+    on_deny: impl Fn() + Clone + 'static,
+) -> impl IntoElement {
+    let enabled_deny = enabled.clone();
+    view()
+        .flex_row()
+        .gap_3()
+        .p_4()
+        .pt_3()
+        .border_t_1()
+        .border_color(rgb(theme::LINE))
+        .bg(rgb(theme::SURFACE))
+        .child(view().flex_1().child(write_button(
+            "Approve",
+            enabled,
+            on_approve,
+            ButtonKind::Primary,
+        )))
+        .child(view().flex_1().child(write_button(
+            "Deny",
+            enabled_deny,
+            on_deny,
+            ButtonKind::Quiet,
+        )))
 }
 
 /// The pane feed for this agent, if the pane is known and watched. Reads
