@@ -375,11 +375,20 @@ pub fn apply(panes: &mut BTreeMap<String, PaneFeed>, down: Down) {
 }
 
 /// One line to the platform log (logcat on Android) and, on iOS, to the
-/// app's stderr, which `simctl launch --console` shows.
+/// app's stderr (`simctl launch --console`) and the unified log.
 pub(crate) fn trace(line: &str) {
     log::info!(target: "pendant", "{line}");
     #[cfg(target_os = "ios")]
-    eprintln!("pendant: {line}");
+    {
+        eprintln!("pendant: {line}");
+        // The unified log too (`log stream` on the simulator): stderr is
+        // not kept when a UI test launches the app. Lines never carry a
+        // pairing payload, a key or a signature.
+        if let Ok(text) = std::ffi::CString::new(format!("pendant: {line}")) {
+            // SAFETY: a constant "%s" format with one NUL-terminated string.
+            unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), text.as_ptr()) };
+        }
+    }
 }
 
 // The worker thread.
