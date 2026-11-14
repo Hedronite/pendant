@@ -31,6 +31,12 @@ Each pane runs a reporter loop that re-reports its lifecycle state every
 couple of seconds. The state is transient by design: without the loop herdr
 drops a reported agent once the pane settles back at a plain shell prompt.
 
+The loop lives in `pane.sh`, which each pane starts through `env -i` and a
+`bash --noprofile --norc`. Before its first line it erases the operator prompt,
+the echo of the command that started it, and any startup noise, and it never
+returns to a shell. So a pane's text is only its marker (and the ticker on
+pane 1): no username, hostname, home path or binary path.
+
 Run the bridge against the session with:
 
 ```bash

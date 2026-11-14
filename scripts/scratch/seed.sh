@@ -18,7 +18,6 @@ HERDR="${HERDR_BIN:-$(command -v herdr)}"
 TICKER_INDEX=1
 BLOCKED_INDEX=2
 REFRESH_SECONDS=2
-SOURCE="custom:pendant-scratch"
 SOCK="$HOME/.config/herdr/sessions/$SESSION/herdr.sock"
 
 h() { "$HERDR" --session "$SESSION" "$@"; }
@@ -52,19 +51,21 @@ third="$(split "$root" down)"
 fourth="$(split "$second" down)"
 panes=("$root" "$second" "$third" "$fourth")
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PANE_RUNNER="$SCRIPT_DIR/pane.sh"
+
 for index in "${!panes[@]}"; do
     pane="${panes[$index]}"
     number=$((index + 1))
     state=idle
     [ "$number" -eq "$BLOCKED_INDEX" ] && state=blocked
-    h pane run "$pane" "echo PENDANT-SCRATCH-MARKER-$number" >/dev/null
-    loop="while :; do '$HERDR' --session '$SESSION' pane report-agent '$pane' --source '$SOURCE' --agent 'scratch-$number' --state '$state' >/dev/null 2>&1; "
-    if [ "$number" -eq "$TICKER_INDEX" ]; then
-        # One pane keeps writing so herdr emits frames; the marker stays in scrollback.
-        loop+='tick=$((tick+1)); printf "PENDANT-SCRATCH-TICK-%s\n" "$tick"; '
-    fi
-    loop+="sleep $REFRESH_SECONDS; done"
-    h pane run "$pane" "$loop" >/dev/null
+    # The runner erases this typed line and the prompt before printing anything,
+    # so the pane holds fixture text only. env -i plus --noprofile --norc keeps
+    # the operator's shell out of it.
+    command="$(printf 'exec env -i HOME=%q PATH=%q HERDR_BIN=%q TICK_PANE=%q REFRESH_SECONDS=%q bash --noprofile --norc %q %q %q %q %q' \
+        "$HOME" "$PATH" "$HERDR" "$TICKER_INDEX" "$REFRESH_SECONDS" \
+        "$PANE_RUNNER" "$number" "$state" "$SESSION" "$pane")"
+    h pane run "$pane" "$command" >/dev/null
 done
 
 for _ in $(seq 1 100); do
