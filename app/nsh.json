@@ -5,6 +5,7 @@
   "build": 1,
   "rust": ".",
   "root": "App",
+  "schemes": ["pendant"],
   "capabilities": {
     "network": {
       "hosts": ["*.ts.net"]

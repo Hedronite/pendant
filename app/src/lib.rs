@@ -40,6 +40,9 @@ pub enum Route {
     Agent(String),
     /// Blocked and done events.
     Inbox,
+    /// Pairing: the payload when a `pendant://pair` link brought one, else
+    /// the screen asks for it to be pasted. `Payload` never prints itself.
+    Pair(Option<net::pair::Payload>),
 }
 
 impl Route {
@@ -49,6 +52,9 @@ impl Route {
             Self::Agents => "agents".to_owned(),
             Self::Agent(id) => format!("agent:{id}"),
             Self::Inbox => "inbox".to_owned(),
+            // One pairing page, whatever brought it: the key never holds
+            // the payload.
+            Self::Pair(_) => "pair".to_owned(),
         }
     }
 }
@@ -101,6 +107,7 @@ pub fn start_routes(start: Option<&str>) -> Vec<Route> {
     let mut routes = vec![Route::Agents];
     match start.map(str::trim) {
         Some("inbox") => routes.push(Route::Inbox),
+        Some("pair") => routes.push(Route::Pair(None)),
         Some(other) => {
             if let Some(id) = other.strip_prefix("agent:").filter(|id| !id.is_empty()) {
                 routes.push(Route::Agent(id.to_owned()));
@@ -111,6 +118,40 @@ pub fn start_routes(start: Option<&str>) -> Vec<Route> {
     routes
 }
 
+/// The URL scheme the app claims (`nsh.json` `schemes`).
+pub const SCHEME: &str = "pendant";
+
+/// The payload in a `pendant://pair?code=<payload>` link, percent-decoded
+/// and checked. Anything else is `None`.
+pub fn pair_link(url: &str) -> Option<net::pair::Payload> {
+    let query = url.trim().strip_prefix("pendant://pair?")?;
+    let code = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("code="))?;
+    net::pair::Payload::parse(&percent_decode(code)?).ok()
+}
+
+/// `%XX` decoding for a link's query value; `None` for a broken escape.
+fn percent_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'%' => {
+                let hex = std::str::from_utf8(bytes.get(at + 1..at + 3)?).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                at += 3;
+            }
+            byte => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The root component.
 #[component]
 pub fn App() -> impl IntoElement {
@@ -119,6 +160,20 @@ pub fn App() -> impl IntoElement {
     net::live::start();
     let start = std::env::var(START_VAR).ok();
     let routes = signal(start_routes(start.as_deref()));
+    // Links that open the app: `pendant://pair?code=<payload>` opens the
+    // pairing page with the payload. Other links are ignored.
+    spawn(async move {
+        loop {
+            let url = next_url_scheme_open().await;
+            match pair_link(&url) {
+                Some(payload) => {
+                    net::live::trace("link: pairing payload received");
+                    Nav { routes }.push(Route::Pair(Some(payload)));
+                }
+                None => net::live::trace("link: ignored"),
+            }
+        }
+    });
     let nav = Nav { routes };
     nav_stack().flex_1().child(each(
         move || routes.get(),
@@ -128,6 +183,7 @@ pub fn App() -> impl IntoElement {
                 Route::Agents => agents::list(nav),
                 Route::Agent(id) => agents::detail(nav, id),
                 Route::Inbox => agents::inbox(nav),
+                Route::Pair(payload) => agents::pairing(nav, payload),
             };
             // The user went back natively (swipe, Android back): drop the
             // page and any above it.
@@ -152,8 +208,50 @@ mod start_tests {
             start_routes(Some("agent:w1:p2")),
             [Route::Agents, Route::Agent("w1:p2".into())]
         );
+        assert_eq!(
+            start_routes(Some("pair")),
+            [Route::Agents, Route::Pair(None)]
+        );
         for ignored in ["", "agent:", "agents", "settings", "agent"] {
             assert_eq!(start_routes(Some(ignored)), [Route::Agents], "{ignored}");
         }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::{pair_link, Route};
+
+    const NONCE: &str = "00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn a_pair_link_carries_the_payload() {
+        let plain = format!("pendant://pair?code=pendant-pair:v1:{NONCE}");
+        let escaped = format!("pendant://pair?code=pendant-pair%3Av1%3A{NONCE}");
+        let want = crate::net::pair::Payload::parse(&format!("pendant-pair:v1:{NONCE}")).unwrap();
+        assert_eq!(pair_link(&plain), Some(want.clone()));
+        assert_eq!(pair_link(&escaped), Some(want.clone()));
+        assert_eq!(
+            pair_link(&format!("pendant://pair?x=1&code=pendant-pair:v1:{NONCE}")),
+            Some(want)
+        );
+        for bad in [
+            "pendant://pair",
+            "pendant://pair?code=",
+            "pendant://pair?code=%zz",
+            "pendant://agents?code=x",
+            "https://pair?code=x",
+        ] {
+            assert_eq!(pair_link(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_pair_route_never_prints_or_keys_its_payload() {
+        let payload =
+            crate::net::pair::Payload::parse(&format!("pendant-pair:v1:{NONCE}")).unwrap();
+        let route = Route::Pair(Some(payload));
+        assert_eq!(route.key(), "pair");
+        assert!(!format!("{route:?}").contains(NONCE));
     }
 }

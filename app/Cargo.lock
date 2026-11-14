@@ -1432,6 +1432,7 @@ dependencies = [
 name = "pendant-app"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "lapis-lattice",
  "lapis-notes",
  "log",

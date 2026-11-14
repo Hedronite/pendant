@@ -17,6 +17,16 @@ pub use detail::detail;
 pub use inbox::inbox;
 pub use list::list;
 
+/// The pairing page. A placeholder from the shell for frontend to replace:
+/// it keeps `lib.rs` building with `Route::Pair`. The screen takes the
+/// payload pasted (or `payload`, from a link) and calls
+/// `net::live::live().pair(..)` / `.pair_with(..)`.
+pub fn pairing(_nav: crate::Nav, _payload: Option<crate::net::pair::Payload>) -> Screen {
+    nsh_base::nav_page()
+        .title("Pair")
+        .child(view().flex_1().p_4().child(text("Pair this device")))
+}
+
 #[cfg(test)]
 mod tests;
 

@@ -26,6 +26,8 @@ tungstenite = { version = "0.28", default-features = false, features = ["handsha
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
 log = "0.4"
+# Device keys and signatures go over the wire as base64 (the bridge decodes STANDARD).
+base64 = "0.22"
 
 # The notes store is host-only until D1: the phone app has no Lapis link
 # (SPEC-shell). CI still builds and tests it on the host.
