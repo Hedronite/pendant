@@ -93,6 +93,9 @@ pub fn bridge() -> Result<net::Bridge, net::ConfigError> {
 /// The root component.
 #[component]
 pub fn App() -> impl IntoElement {
+    // The live link: snapshot and inbox polling, and the WebSocket worker.
+    // Screens read it with `net::live::live()`.
+    net::live::start();
     let routes = signal(vec![Route::Agents]);
     let nav = Nav { routes };
     nav_stack().flex_1().child(each(

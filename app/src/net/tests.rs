@@ -93,7 +93,9 @@ fn the_bridge_address_is_an_https_origin() {
         bridge.url("/v1/snapshot"),
         "https://bridge.example.ts.net:8443/v1/snapshot"
     );
-    assert!(Bridge::parse("https://bridge.example.ts.net").is_ok());
+    assert_eq!(bridge.host_port(), ("bridge.example.ts.net", 8443));
+    let plain = Bridge::parse("https://bridge.example.ts.net").unwrap();
+    assert_eq!(plain.host_port(), ("bridge.example.ts.net", 443));
 
     for bad in [
         "http://bridge.example.ts.net:8443",

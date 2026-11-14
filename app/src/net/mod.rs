@@ -1,11 +1,12 @@
 //! The app's line to the bridge: HTTP through nsh's `fetch` (the platform's
 //! own stack: NSURLSession on iOS, HttpURLConnection on Android) and the
-//! WebSocket envelope in [`ws`]. No tokio or reqwest in the app.
+//! WebSocket in [`live`] (no async runtime of its own).
 //!
 //! The bridge's address is not in the source. It comes from
 //! `PENDANT_BRIDGE_URL` when the app is built, for example
 //! `PENDANT_BRIDGE_URL=https://bridge.example.ts.net:8443 nsh package …`.
 
+pub mod live;
 pub mod types;
 pub mod ws;
 
@@ -84,7 +85,20 @@ impl Bridge {
 
     /// `wss://host[:port]/v1/ws`.
     pub fn ws_url(&self) -> String {
-        format!("wss://{}/v1/ws", &self.origin["https://".len()..])
+        format!("wss://{}/v1/ws", self.authority())
+    }
+
+    /// The host and port to dial (443 when the origin names none).
+    pub fn host_port(&self) -> (&str, u16) {
+        let authority = self.authority();
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse().unwrap_or(443)),
+            None => (authority, 443),
+        }
+    }
+
+    fn authority(&self) -> &str {
+        &self.origin["https://".len()..]
     }
 
     fn url(&self, path: &str) -> String {
