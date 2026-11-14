@@ -31,6 +31,8 @@ tailscale serve --bg --https=8443 http://127.0.0.1:8780
 
 Pendant HTTPS is port `8443`, proxying `http://127.0.0.1:8780`. Port `443` is not the Pendant route. Set `PENDANT_SERVE_ORIGIN` to the exact origin a browser sends on that route. Leaving it unset makes those requests `403`.
 
+Only Serve's HTTP-proxy mode is supported, with exactly that command. The local-only gate on pairing trusts the forwarding header Serve adds, so a raw TCP forward, a TLS-terminated TCP forward, or any other proxy that does not add `X-Forwarded-For` defeats the gate. Do not use one.
+
 ## Security
 
 - Tailnet-only. Pendant listens on loopback. Reach it through Tailscale Serve, not the public internet.

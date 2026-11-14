@@ -15,6 +15,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
+use subtle::ConstantTimeEq;
 
 /// Session takeover is not implemented.
 pub const TAKEOVER: bool = false;
@@ -24,6 +25,8 @@ pub const DEVICE_SIGNATURE: &str = "ecdsa-p256-sha256";
 
 const GRANT_TTL: Duration = Duration::from_secs(30);
 const MAX_CHALLENGES: usize = 64;
+/// Bound on client keys held by the challenge rate limiter.
+const MAX_CLIENTS: usize = 1024;
 
 #[derive(Clone)]
 pub struct Pairing {
@@ -37,7 +40,7 @@ struct Inner {
     challenge_window: Duration,
     nonces: Vec<String>,
     challenges: Vec<Ticket>,
-    recent: Vec<Instant>,
+    recent: HashMap<String, Vec<Instant>>,
     devices: HashMap<String, Device>,
     grants: HashMap<String, Grant>,
 }
@@ -71,7 +74,7 @@ impl Pairing {
                 challenge_window: Duration::from_secs(1),
                 nonces: Vec::new(),
                 challenges: Vec::new(),
-                recent: Vec::new(),
+                recent: HashMap::new(),
                 devices: HashMap::new(),
                 grants: HashMap::new(),
             })),
@@ -107,7 +110,9 @@ impl Pairing {
         nonce
     }
 
-    pub fn issue_challenge(&self) -> Result<String, AuthError> {
+    /// Challenges are rate limited per client key, so one client cannot delay
+    /// another. The key comes from the proxy identity, never the request body.
+    pub fn issue_challenge(&self, client: &str) -> Result<String, AuthError> {
         let mut inner = self.inner.lock().expect("pairing");
         let now = Instant::now();
         let ttl = inner.challenge_ttl;
@@ -116,14 +121,19 @@ impl Pairing {
         inner
             .challenges
             .retain(|ticket| now.saturating_duration_since(ticket.issued) <= ttl);
-        inner
-            .recent
-            .retain(|issued| now.saturating_duration_since(*issued) <= window);
-        if inner.recent.len() >= rate {
+        inner.recent.retain(|_, issued| {
+            issued.retain(|at| now.saturating_duration_since(*at) <= window);
+            !issued.is_empty()
+        });
+        if inner.recent.len() >= MAX_CLIENTS && !inner.recent.contains_key(client) {
+            return Err(AuthError::RateLimited);
+        }
+        let issued = inner.recent.entry(client.to_string()).or_default();
+        if issued.len() >= rate {
             return Err(AuthError::RateLimited);
         }
         let challenge = random_token();
-        inner.recent.push(now);
+        issued.push(now);
         if inner.challenges.len() >= MAX_CHALLENGES {
             inner.challenges.remove(0);
         }
@@ -364,23 +374,10 @@ fn push_capped(items: &mut Vec<String>, item: String) {
     items.push(item);
 }
 
-fn ct_eq(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
 fn take_token(items: &mut Vec<String>, token: &str) -> bool {
     let mut found = None;
     for (index, item) in items.iter().enumerate() {
-        if ct_eq(item, token) {
+        if bool::from(item.as_bytes().ct_eq(token.as_bytes())) {
             found = Some(index);
         }
     }
@@ -398,7 +395,7 @@ fn take_ticket(inner: &mut Inner, token: &str) -> bool {
     let mut found = None;
     for (index, ticket) in inner.challenges.iter().enumerate() {
         let fresh = now.saturating_duration_since(ticket.issued) <= ttl;
-        if fresh && ct_eq(&ticket.token, token) {
+        if fresh && bool::from(ticket.token.as_bytes().ct_eq(token.as_bytes())) {
             found = Some(index);
         }
     }
@@ -406,7 +403,14 @@ fn take_ticket(inner: &mut Inner, token: &str) -> bool {
         .challenges
         .retain(|ticket| now.saturating_duration_since(ticket.issued) <= ttl || found.is_some());
     if let Some(index) = found {
-        if index < inner.challenges.len() && ct_eq(&inner.challenges[index].token, token) {
+        if index < inner.challenges.len()
+            && bool::from(
+                inner.challenges[index]
+                    .token
+                    .as_bytes()
+                    .ct_eq(token.as_bytes()),
+            )
+        {
             inner.challenges.remove(index);
             return true;
         }
