@@ -1,0 +1,13 @@
+{
+  "name": "Pendant",
+  "id": "com.hedronite.pendant",
+  "version": "0.0.1",
+  "build": 1,
+  "rust": ".",
+  "root": "App",
+  "capabilities": {
+    "network": {
+      "hosts": ["*.ts.net"]
+    }
+  }
+}

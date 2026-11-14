@@ -2,17 +2,26 @@
 name = "pendant-app"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/Hedronite/pendant"
 description = "Pendant's phone app"
 publish = false
 
-# Until app/src/lib.rs lands, the notes store is the library root.
 [lib]
-path = "src/notes/store.rs"
+path = "src/lib.rs"
 
 [dependencies]
+# The shell: nsh's Rust UI, its fetch and its runtime. Exact pins, because
+# `nsh package` builds the runner against the CLI's own version (0.5.0).
+nsh-core = "=0.5.0"
+nsh-base = "=0.5.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The notes store is host-only until D1: the phone app has no Lapis link
+# (SPEC-shell). CI still builds and tests it on the host.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 # Pinned to the Lapis v0.5.0 release merge (rusqlite 0.42, libsqlite3-sys 0.40;
 # clears RUSTSEC-2026-0459). It still carries GOAL-mobile G0-G3. lapis-notes is
 # publish = false, so both stay git deps at this exact rev, never a version.
