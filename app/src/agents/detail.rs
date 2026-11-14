@@ -1,6 +1,9 @@
 //! One agent: its status, herdr's recent output, and the pane frames the
 //! live link watches for it.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use nsh_base::nav_page;
 use nsh_core::prelude::*;
 
@@ -31,10 +34,16 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     // The agent's pane: watched once the snapshot names it, and left when
     // the page does. The guard keeps the 3 s snapshot refresh from
     // watch/unwatch churn.
+    //
+    // The watched id lives in an Rc slot, not a signal: the page owner's
+    // signals are disposed before its cleanups run, and a cleanup that
+    // reads a disposed signal fails without unwatching (a Back then keeps
+    // the pane's frames flowing).
     let watch_id = id.clone();
-    let watched = signal(None::<String>);
+    let watched = Rc::new(RefCell::new(None::<String>));
+    let effect_watched = Rc::clone(&watched);
     effect(move || {
-        if watched.get_untracked().is_some() {
+        if effect_watched.borrow().is_some() {
             return;
         }
         let pane = live.snapshot.with(|snap| {
@@ -44,11 +53,12 @@ pub fn detail(nav: Nav, id: String) -> Screen {
         });
         if let Some(pane) = pane {
             live.watch(&pane);
-            watched.set(Some(pane));
+            *effect_watched.borrow_mut() = Some(pane);
         }
     });
+    let cleanup_watched = watched;
     cleanup(move || {
-        if let Some(pane) = watched.get_untracked() {
+        if let Some(pane) = cleanup_watched.borrow_mut().take() {
             live.unwatch(&pane);
         }
     });
