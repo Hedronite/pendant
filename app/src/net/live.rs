@@ -516,6 +516,63 @@ mod tests {
         assert!(!absorb(&rx, &mut BTreeMap::new()));
     }
 
+    /// Drives the worker against a running bridge:
+    /// `PENDANT_BRIDGE_URL=https://… PENDANT_WATCH_PANE=w1:p1 cargo test
+    /// --manifest-path app/Cargo.toml -- --ignored --nocapture live_socket`.
+    #[test]
+    #[ignore = "needs a running bridge (PENDANT_BRIDGE_URL at run time)"]
+    fn live_socket_sees_rising_frames() {
+        let url = std::env::var("PENDANT_BRIDGE_URL").expect("PENDANT_BRIDGE_URL");
+        let pane = std::env::var("PENDANT_WATCH_PANE").unwrap_or_else(|_| "w1:p1".into());
+        let want: u64 = std::env::var("PENDANT_WANT_FRAMES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(3);
+        let bridge = Bridge::parse(&url).expect("an https origin");
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || worker(bridge, cmd_rx, event_tx));
+        cmd_tx
+            .send(Cmd::Watch {
+                pane: pane.clone(),
+                cols: COLS,
+                rows: ROWS,
+            })
+            .unwrap();
+
+        let mut panes = BTreeMap::new();
+        let mut links = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            match event_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Event::Link(link)) => links.push(link),
+                Ok(Event::Down(down)) => apply(&mut panes, down),
+                Err(_) => {}
+            }
+            if panes.get(&pane).is_some_and(|feed| feed.seq.frames >= want) {
+                break;
+            }
+        }
+        drop(cmd_tx);
+        worker.join().unwrap();
+
+        let feed = panes.get(&pane).cloned().unwrap_or_default();
+        println!(
+            "links={links:?} pane={pane} frames={} last_seq={:?} out_of_order={} full={} scrollback_chars={}",
+            feed.seq.frames,
+            feed.seq.last(),
+            feed.seq.out_of_order,
+            feed.full_frames,
+            feed.scrollback.as_deref().map_or(0, str::len),
+        );
+        assert!(
+            links.contains(&Link::Open),
+            "the socket never opened: {links:?}"
+        );
+        assert!(feed.seq.frames >= want, "too few frames");
+        assert_eq!(feed.seq.out_of_order, 0, "seq did not rise");
+    }
+
     #[test]
     fn the_tls_config_builds_with_roots() {
         let config = tls_config();
