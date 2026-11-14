@@ -7,7 +7,6 @@ use std::rc::Rc;
 
 use nsh_base::alert_dialog;
 use nsh_base::nav_page;
-use nsh_core::element::create_root;
 use nsh_core::element::input;
 use nsh_core::prelude::*;
 
@@ -501,34 +500,23 @@ async fn with_grant<T, F: Future<Output = Result<T, WriteError>>>(
     run().await
 }
 
-/// A detached task kept alive: its root owner and its handle, released
-/// by the task itself when it ends.
-type DetachedTask = Option<(Owner, Spawned<()>)>;
-
 /// Runs a write outside the page's owner: leaving the page does not
 /// cancel it (a pairing task died exactly that way). The `settle` step
 /// touches the page's state only while the page still lives.
-fn detached_write<T>(
+fn detached_write<T: 'static>(
     page: Owner,
     future: impl Future<Output = T> + 'static,
     settle: impl FnOnce(T) + 'static,
 ) {
-    // Dropping the spawned handle cancels the task before its first
-    // poll, and the root owner would go with it, so both live in a slot
-    // the task empties as its last step: the root and the handle are
-    // released only when the write is done.
-    let slot: Rc<RefCell<DetachedTask>> = Rc::new(RefCell::new(None));
-    let keep = Rc::clone(&slot);
-    let (owner, task) = create_root(move || {
-        spawn(async move {
-            let out = future.await;
-            if page.is_live() {
-                settle(out);
-            }
-            keep.borrow_mut().take();
-        })
+    // Runs under the app root and keeps its task handle until it ends
+    // (dropping an nsh task handle cancels the task); settles only while
+    // the page is still there.
+    crate::net::live::spawn_detached(async move {
+        let out = future.await;
+        if page.is_live() {
+            settle(out);
+        }
     });
-    *slot.borrow_mut() = Some((owner, task));
 }
 
 /// Sets the write error from a task.
