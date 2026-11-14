@@ -2,14 +2,28 @@
 //! a `pendant://pair` link.
 
 use nsh_base::nav_page;
-use nsh_core::element::input;
+use nsh_core::element::{create_root, input};
 use nsh_core::prelude::*;
+use std::future::Future;
 
-use crate::agents::{page_header, write_button, write_note, ButtonKind};
+use crate::agents::{page_header, write_button, ButtonKind};
 use crate::net::live::{live, Live};
-use crate::net::pair::{PairState, Payload, WriteError};
+use crate::net::pair::{PairState, Payload};
 use crate::theme;
 use crate::Nav;
+
+/// Runs a pair task in a detached root: the pairing page owns its signals,
+/// not the task, so the page going away does not cancel a pair in flight
+/// (a dismissal used to cancel it 71 ms in, before the POST). The page
+/// reads [`PairState`] for what happened; the task touches nothing the
+/// page owns.
+fn detached_pair(future: impl Future<Output = ()> + 'static) {
+    // The root lives until it is disposed, and nothing ever disposes
+    // this one: the task runs to its end. Its handle, spawned detached,
+    // does not cancel on drop.
+    let (_owner, task) = create_root(move || spawn(future));
+    drop(task);
+}
 
 /// The pairing page. A payload carried by a `pendant://` link pairs at
 /// once; otherwise the payload is pasted or typed, then paired. Every path
@@ -17,7 +31,6 @@ use crate::Nav;
 pub fn pairing(nav: Nav, payload: Option<Payload>) -> Screen {
     let live = live();
     let draft = signal(String::new());
-    let error = signal(None::<WriteError>);
 
     // The link's payload: pair once on arrival, then leave.
     let carried = payload;
@@ -29,10 +42,9 @@ pub fn pairing(nav: Nav, payload: Option<Payload>) -> Screen {
         if let Some(payload) = carried.clone() {
             started.set(true);
             let live = live;
-            spawn(async move {
-                match live.pair_with(&payload).await {
-                    Ok(()) => nav.back(),
-                    Err(err) => error.set(Some(err)),
+            detached_pair(async move {
+                if live.pair_with(&payload).await.is_ok() {
+                    nav.back();
                 }
             });
         }
@@ -68,7 +80,7 @@ pub fn pairing(nav: Nav, payload: Option<Payload>) -> Screen {
                 ))
                 .child(when(
                     move || !matches!(live.pairing.get(), PairState::Paired { .. }),
-                    move || pair_controls(live, draft, error),
+                    move || pair_controls(live, draft),
                 )),
         )
 }
@@ -112,11 +124,7 @@ fn paired_card(live: Live, nav: Nav) -> impl IntoElement {
 }
 
 /// The payload input, the paste and pair buttons, and what went wrong.
-fn pair_controls(
-    live: Live,
-    draft: Signal<String>,
-    error: Signal<Option<WriteError>>,
-) -> impl IntoElement {
+fn pair_controls(live: Live, draft: Signal<String>) -> impl IntoElement {
     let enabled = move || {
         live.pairing.get() != PairState::Pairing
             && !matches!(live.pairing.get(), PairState::Paired { .. })
@@ -160,15 +168,28 @@ fn pair_controls(
                     move || enabled() && !draft.get().trim().is_empty(),
                     move || {
                         let code = draft.get();
-                        spawn(async move {
-                            error.set(None);
-                            if let Err(err) = live.pair(&code).await {
-                                error.set(Some(err));
-                            }
+                        detached_pair(async move {
+                            live.pair(&code).await.ok();
                         });
                     },
                     ButtonKind::Primary,
                 )),
         )
-        .child(write_note(move || error.get()))
+        // A pair that did not happen: `pair_with` writes the reason into
+        // the pairing state, which this page only reads.
+        .child(when(
+            move || matches!(live.pairing.get(), PairState::Unpaired { reason: Some(_) }),
+            move || {
+                text(move || match live.pairing.get() {
+                    PairState::Unpaired {
+                        reason: Some(reason),
+                    } => reason,
+                    _ => String::new(),
+                })
+                .test_id("write-error")
+                .text_size(px(12.0))
+                .text_color(rgb(theme::GOLD))
+                .number_of_lines(3)
+            },
+        ))
 }
