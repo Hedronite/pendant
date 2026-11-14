@@ -4,7 +4,9 @@
 # Usage: scripts/scratch/teardown.sh [session-name]
 set -euo pipefail
 
-SESSION="${1:-${PENDANT_SCRATCH_SESSION:-pendant-shell-g1}}"
+# shellcheck source=lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+SESSION="$(scratch_session_name "$@")" || exit 1
 HERDR="${HERDR_BIN:-$(command -v herdr)}"
 
 if "$HERDR" --session "$SESSION" api snapshot >/dev/null 2>&1; then

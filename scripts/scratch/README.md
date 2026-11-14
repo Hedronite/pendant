@@ -13,6 +13,12 @@ The session lives at `~/.config/herdr/sessions/<name>/herdr.sock`. `seed.sh`
 prints the socket path and the agent summary, and refuses to seed a session
 that is already running.
 
+Both scripts take the name from the first argument, else
+`PENDANT_SCRATCH_SESSION`, else `pendant-shell-g1`, and then refuse anything
+that does not start with `pendant-scratch` or `pendant-shell`, plus an empty
+name (`lib.sh`). They stop and delete sessions, so a typo must never reach a
+live one.
+
 What it creates:
 
 - one workspace labelled `pendant-scratch`, four panes in a 2x2 split;
