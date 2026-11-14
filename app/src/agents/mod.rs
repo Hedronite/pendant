@@ -202,6 +202,7 @@ pub(crate) fn write_button(
     let color_enabled = enabled;
     view()
         .test_id(id)
+        .label(label)
         .rounded(px(10.0))
         .px_3()
         .py_2()
