@@ -23,7 +23,9 @@ What it creates:
 
 - one workspace labelled `pendant-scratch`, four panes in a 2x2 split;
 - a marker line `PENDANT-SCRATCH-MARKER-<n>` in each pane;
-- four reported agents `scratch-1` … `scratch-4`, with `scratch-2` blocked.
+- four reported agents `scratch-1` … `scratch-4`, with `scratch-2` blocked;
+- a `PENDANT-SCRATCH-TICK-<n>` line in pane 1 every couple of seconds, so
+  herdr keeps emitting frames for the WebSocket link.
 
 Each pane runs a reporter loop that re-reports its lifecycle state every
 couple of seconds. The state is transient by design: without the loop herdr
