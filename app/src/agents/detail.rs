@@ -223,11 +223,10 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                 .child(when(
                     move || live.snapshot.get().is_some(),
                     move || {
-                        // The branch runs again on every flip, so each run
-                        // gets its own copies of the handlers.
+                        // The branch runs again on every flip: non-Copy
+                        // handlers are cloned per run, Copy ones just move.
                         let body_id = body_id.clone();
                         let write_id = write_id.clone();
-                        let enabled = enabled.clone();
                         let on_prompt = on_prompt.clone();
                         let on_approve = on_approve.clone();
                         let on_deny = on_deny.clone();
@@ -241,20 +240,14 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                                 draft,
                                 made,
                                 write_error,
-                                enabled.clone(),
+                                enabled,
                                 on_prompt,
-                                on_open_grant.clone(),
+                                on_open_grant,
                                 on_worktree,
                             ))
                             .child(when(
                                 move || blocked(live, &write_id) && paired(),
-                                move || {
-                                    decision_bar(
-                                        enabled.clone(),
-                                        on_approve.clone(),
-                                        on_deny.clone(),
-                                    )
-                                },
+                                move || decision_bar(enabled, on_approve.clone(), on_deny.clone()),
                             ))
                     },
                 ))
@@ -494,20 +487,25 @@ fn blocked(live: Live, id: &str) -> bool {
 
 /// The write controls: the grant state, the prompt input, the worktree
 /// action, and the last write's error.
+#[allow(
+    clippy::too_many_arguments,
+    // One control per argument: the grant state, the note, the input,
+    // and one closure per action.
+)]
 fn write_section(
     live: Live,
     draft: Signal<String>,
     made: Signal<Option<String>>,
     error: Signal<Option<WriteError>>,
-    enabled: impl Fn() -> bool + Clone + 'static,
+    enabled: impl Fn() -> bool + Copy + 'static,
     on_prompt: impl Fn() + Clone + 'static,
-    on_open_grant: impl Fn() + Clone + 'static,
+    on_open_grant: impl Fn() + Copy + 'static,
     on_worktree: impl Fn() + Clone + 'static,
 ) -> impl IntoElement {
-    let enabled_send = enabled.clone();
-    let enabled_wt = enabled.clone();
-    let enabled_cond = enabled.clone();
-    let enabled_grant = enabled.clone();
+    let enabled_send = enabled;
+    let enabled_wt = enabled;
+    let enabled_cond = enabled;
+    let enabled_grant = enabled;
     view()
         .flex_col()
         .gap_3()
@@ -567,12 +565,10 @@ fn write_section(
         .child(when(
             move || enabled_cond() && !live.grant_open(),
             move || {
-                let on_open_grant = on_open_grant.clone();
-                let enabled = enabled_grant.clone();
                 view().child(write_button(
                     "open-grant",
                     "Open grant",
-                    enabled,
+                    enabled_grant,
                     on_open_grant,
                     ButtonKind::Quiet,
                 ))
@@ -583,11 +579,11 @@ fn write_section(
 
 /// The bar pinned under the output while the agent is blocked.
 fn decision_bar(
-    enabled: impl Fn() -> bool + Clone + 'static,
+    enabled: impl Fn() -> bool + Copy + 'static,
     on_approve: impl Fn() + Clone + 'static,
     on_deny: impl Fn() + Clone + 'static,
 ) -> impl IntoElement {
-    let enabled_deny = enabled.clone();
+    let enabled_deny = enabled;
     view()
         .test_id("decision-bar")
         .flex_row()
