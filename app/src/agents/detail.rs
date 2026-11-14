@@ -613,6 +613,13 @@ fn write_section(
                 }
             })
             .test_id("grant-line")
+            .label(move || {
+                if live.grant_open() {
+                    "grant open".to_owned()
+                } else {
+                    "grant closed".to_owned()
+                }
+            })
             .text_size(px(12.0))
             .text_color(rgb(theme::DIM)),
         )
