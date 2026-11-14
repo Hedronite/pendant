@@ -11,6 +11,12 @@ pub mod agents;
 pub mod net;
 pub mod theme;
 
+#[path = "platform/d1.rs"]
+mod d1;
+/// The D1 folder probe (G3): the phone's folder picker and what it gives.
+#[path = "platform/folders.rs"]
+pub mod folders;
+
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 #[path = "notes/store.rs"]
 mod store;
@@ -43,6 +49,8 @@ pub enum Route {
     /// Pairing: the payload when a `pendant://pair` link brought one, else
     /// the screen asks for it to be pasted. `Payload` never prints itself.
     Pair(Option<net::pair::Payload>),
+    /// The D1 folder probe (`pendant://d1`).
+    D1,
 }
 
 impl Route {
@@ -55,6 +63,7 @@ impl Route {
             // One pairing page, whatever brought it: the key never holds
             // the payload.
             Self::Pair(_) => "pair".to_owned(),
+            Self::D1 => "d1".to_owned(),
         }
     }
 }
@@ -108,6 +117,7 @@ pub fn start_routes(start: Option<&str>) -> Vec<Route> {
     match start.map(str::trim) {
         Some("inbox") => routes.push(Route::Inbox),
         Some("pair") => routes.push(Route::Pair(None)),
+        Some("d1") => routes.push(Route::D1),
         Some(other) => {
             if let Some(id) = other.strip_prefix("agent:").filter(|id| !id.is_empty()) {
                 routes.push(Route::Agent(id.to_owned()));
@@ -152,6 +162,13 @@ fn percent_decode(raw: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Whether `url` is the D1 probe link, `pendant://d1`.
+pub fn is_d1_link(url: &str) -> bool {
+    url.strip_prefix(SCHEME)
+        .and_then(|rest| rest.strip_prefix("://"))
+        .is_some_and(|rest| rest.trim_end_matches('/') == "d1")
+}
+
 /// The root component.
 #[component]
 pub fn App() -> impl IntoElement {
@@ -165,12 +182,14 @@ pub fn App() -> impl IntoElement {
     spawn(async move {
         loop {
             let url = next_url_scheme_open().await;
-            match pair_link(&url) {
-                Some(payload) => {
-                    net::live::trace("link: pairing payload received");
-                    Nav { routes }.push(Route::Pair(Some(payload)));
-                }
-                None => net::live::trace("link: ignored"),
+            if let Some(payload) = pair_link(&url) {
+                net::live::trace("link: pairing payload received");
+                Nav { routes }.push(Route::Pair(Some(payload)));
+            } else if is_d1_link(&url) {
+                net::live::trace("link: d1 probe");
+                Nav { routes }.push(Route::D1);
+            } else {
+                net::live::trace("link: ignored");
             }
         }
     });
@@ -184,6 +203,7 @@ pub fn App() -> impl IntoElement {
                 Route::Agent(id) => agents::detail(nav, id),
                 Route::Inbox => agents::inbox(nav),
                 Route::Pair(payload) => agents::pairing(nav, payload),
+                Route::D1 => d1::d1(nav),
             };
             // The user went back natively (swipe, Android back): drop the
             // page and any above it.
@@ -194,6 +214,26 @@ pub fn App() -> impl IntoElement {
             })
         },
     ))
+}
+
+#[cfg(test)]
+mod d1_link_tests {
+    use super::is_d1_link;
+
+    #[test]
+    fn only_the_d1_link_opens_the_probe() {
+        assert!(is_d1_link("pendant://d1"));
+        assert!(is_d1_link("pendant://d1/"));
+        for no in [
+            "pendant://d1x",
+            "pendant://pair?code=x",
+            "other://d1",
+            "pendant:d1",
+            "d1",
+        ] {
+            assert!(!is_d1_link(no), "{no}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +252,7 @@ mod start_tests {
             start_routes(Some("pair")),
             [Route::Agents, Route::Pair(None)]
         );
+        assert_eq!(start_routes(Some("d1")), [Route::Agents, Route::D1]);
         for ignored in ["", "agent:", "agents", "settings", "agent"] {
             assert_eq!(start_routes(Some(ignored)), [Route::Agents], "{ignored}");
         }

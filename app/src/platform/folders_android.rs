@@ -25,7 +25,11 @@ fn error_of(code: i32) -> FolderError {
 
 /// Calls a static `String`-returning method; `None` means it failed with
 /// `lastError` set, which comes back as the error.
-fn call_string(method: &'static str, signature: &'static str, arg: Option<String>) -> Result<String, FolderError> {
+fn call_string(
+    method: &'static str,
+    signature: &'static str,
+    arg: Option<String>,
+) -> Result<String, FolderError> {
     let (value, code) = with_java(CLASS, |env, class| {
         let java_arg = match &arg {
             Some(text) => Some(env.new_string(text)?),
@@ -35,7 +39,9 @@ fn call_string(method: &'static str, signature: &'static str, arg: Option<String
             Some(text) => vec![JValue::Object(text)],
             None => vec![JValue::Int(PICK_SECONDS)],
         };
-        let result = env.call_static_method(class, method, signature, &args)?.l()?;
+        let result = env
+            .call_static_method(class, method, signature, &args)?
+            .l()?;
         let code = env.get_static_field(class, "lastError", "I")?.i()?;
         if result.is_null() {
             return Ok((None, code));
@@ -50,8 +56,13 @@ fn call_string(method: &'static str, signature: &'static str, arg: Option<String
 fn kept(tree: String) -> Result<bool, FolderError> {
     with_java(CLASS, |env, class| {
         let text = env.new_string(&tree)?;
-        env.call_static_method(class, "kept", "(Ljava/lang/String;)Z", &[JValue::Object(&text)])?
-            .z()
+        env.call_static_method(
+            class,
+            "kept",
+            "(Ljava/lang/String;)Z",
+            &[JValue::Object(&text)],
+        )?
+        .z()
     })
     .map_err(|err| FolderError::Platform(err.to_string()))
 }
@@ -89,7 +100,11 @@ pub(super) async fn pick() -> Result<FolderReport, FolderError> {
                 .is_ok(),
             None => false,
         };
-        let counts = call_string("count", "(Ljava/lang/String;)Ljava/lang/String;", Some(tree))?;
+        let counts = call_string(
+            "count",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            Some(tree),
+        )?;
         Ok(FolderReport {
             persisted,
             ..parse_counts(&counts)?
@@ -106,7 +121,11 @@ pub(super) async fn remembered() -> Result<FolderReport, FolderError> {
         if !kept(tree.clone())? {
             return Err(FolderError::NothingKept);
         }
-        let counts = call_string("count", "(Ljava/lang/String;)Ljava/lang/String;", Some(tree))?;
+        let counts = call_string(
+            "count",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            Some(tree),
+        )?;
         Ok(FolderReport {
             persisted: true,
             restored: true,
@@ -124,7 +143,15 @@ mod tests {
     #[test]
     fn counts_parse_from_the_java_line() {
         let report = parse_counts("25,30,3,1").unwrap();
-        assert_eq!((report.md_top, report.md_total, report.other_files, report.folders), (25, 30, 3, 1));
+        assert_eq!(
+            (
+                report.md_top,
+                report.md_total,
+                report.other_files,
+                report.folders
+            ),
+            (25, 30, 3, 1)
+        );
         assert!(!report.posix_path);
         assert!(parse_counts("1,2,3").is_err());
         assert!(parse_counts("a,b,c,d").is_err());

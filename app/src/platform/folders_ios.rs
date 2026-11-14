@@ -114,9 +114,11 @@ fn keep_bookmark(url: &NSURL) -> Result<(), FolderError> {
         .map_err(|err| FolderError::Platform(err.localizedDescription().to_string()))?;
     let file = kept_file().ok_or(FolderError::Platform("no data directory".into()))?;
     if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir).map_err(|err| FolderError::Platform(err.kind().to_string()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|err| FolderError::Platform(err.kind().to_string()))?;
     }
-    std::fs::write(&file, data.to_vec()).map_err(|err| FolderError::Platform(err.kind().to_string()))
+    std::fs::write(&file, data.to_vec())
+        .map_err(|err| FolderError::Platform(err.kind().to_string()))
 }
 
 /// The view controller to present from: the key window's root, then down
@@ -142,7 +144,8 @@ pub(super) async fn pick() -> Outcome {
         let Some(mtm) = MainThreadMarker::new() else {
             return Err(FolderError::Platform("not on the main thread".into()));
         };
-        let presenter = presenter(mtm).ok_or(FolderError::Platform("no window to present from".into()))?;
+        let presenter =
+            presenter(mtm).ok_or(FolderError::Platform("no window to present from".into()))?;
         // SAFETY: a framework constant, alive for the process.
         let folder: &UTType = unsafe { UTTypeFolder };
         let types = NSArray::from_slice(&[folder]);

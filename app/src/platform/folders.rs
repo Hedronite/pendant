@@ -167,9 +167,17 @@ mod tests {
         let nested = root.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         for n in 1..=25 {
-            std::fs::write(root.join(format!("note-{n:02}.md")), format!("# Fixture note {n}\n")).unwrap();
+            std::fs::write(
+                root.join(format!("note-{n:02}.md")),
+                format!("# Fixture note {n}\n"),
+            )
+            .unwrap();
         }
-        for (name, body) in [("readme.txt", "made up"), ("data.json", "{}"), ("image.PNG", "x")] {
+        for (name, body) in [
+            ("readme.txt", "made up"),
+            ("data.json", "{}"),
+            ("image.PNG", "x"),
+        ] {
             std::fs::write(root.join(name), body).unwrap();
         }
         for n in 1..=5 {
