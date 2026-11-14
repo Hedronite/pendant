@@ -325,6 +325,12 @@ pub fn start() -> Live {
     };
     provide_context(live);
     ROOT.with(|root| *root.borrow_mut() = Some(Owner::current()));
+    // Which build is running: the commit given at build time, so a run's
+    // log names the exact app it tested.
+    trace(&format!(
+        "build {}",
+        option_env!("PENDANT_BUILD_SHA").unwrap_or("dev")
+    ));
     let bridge = match crate::bridge() {
         Ok(bridge) => bridge,
         Err(err) => {
