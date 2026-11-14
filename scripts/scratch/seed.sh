@@ -15,6 +15,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 SESSION="$(scratch_session_name "$@")" || exit 1
 LABEL="${PENDANT_SCRATCH_LABEL:-pendant-scratch}"
 HERDR="${HERDR_BIN:-$(command -v herdr)}"
+TICKER_INDEX=1
 BLOCKED_INDEX=2
 REFRESH_SECONDS=2
 SOURCE="custom:pendant-scratch"
@@ -57,9 +58,13 @@ for index in "${!panes[@]}"; do
     state=idle
     [ "$number" -eq "$BLOCKED_INDEX" ] && state=blocked
     h pane run "$pane" "echo PENDANT-SCRATCH-MARKER-$number" >/dev/null
-    h pane run "$pane" \
-        "while :; do '$HERDR' --session '$SESSION' pane report-agent '$pane' --source '$SOURCE' --agent 'scratch-$number' --state '$state' >/dev/null 2>&1; sleep $REFRESH_SECONDS; done" \
-        >/dev/null
+    loop="while :; do '$HERDR' --session '$SESSION' pane report-agent '$pane' --source '$SOURCE' --agent 'scratch-$number' --state '$state' >/dev/null 2>&1; "
+    if [ "$number" -eq "$TICKER_INDEX" ]; then
+        # One pane keeps writing so herdr emits frames; the marker stays in scrollback.
+        loop+='tick=$((tick+1)); printf "PENDANT-SCRATCH-TICK-%s\n" "$tick"; '
+    fi
+    loop+="sleep $REFRESH_SECONDS; done"
+    h pane run "$pane" "$loop" >/dev/null
 done
 
 for _ in $(seq 1 100); do
