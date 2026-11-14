@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use nsh_base::alert_dialog;
 use nsh_base::nav_page;
+use nsh_core::element::create_root;
 use nsh_core::element::input;
 use nsh_core::prelude::*;
 
@@ -17,6 +18,7 @@ use crate::agents::{
 use crate::net::live::{live, Live, PaneFeed};
 use crate::net::pair::{PairState, WorktreeRequest, WriteError};
 use crate::net::types::AgentDetail;
+use crate::net::NetError;
 use crate::theme;
 use crate::Nav;
 
@@ -71,53 +73,62 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     });
 
     // The write controls. One `busy` at a time: a second biometric prompt
-    // does not stack on the first.
+    // does not stack on the first. Each write runs outside this page's
+    // owner, so leaving the page does not cancel it; the page's state is
+    // only written back while the page still lives.
+    let page = Owner::current();
     let busy = signal(false);
     let write_error = signal(None::<WriteError>);
     let draft = signal(String::new());
     let made = signal(None::<String>);
-
     let paired = move || matches!(live.pairing.get(), PairState::Paired { .. });
     let enabled = move || !busy.get() && paired();
-
     let prompt_id = id.clone();
-    let on_prompt = move || {
-        let text = draft.get().trim().to_owned();
+    let send_prompt = move |text: String| {
         if text.is_empty() {
             return;
         }
         let live = live;
         let id = prompt_id.clone();
-        spawn(async move {
-            busy.set(true);
-            error_set(&write_error, None);
-            let result = with_grant(live, || live.prompt(&id, &text)).await;
-            busy.set(false);
-            match result {
-                Ok(()) => {
-                    draft.set(String::new());
-                    made.set(Some("Prompt sent.".to_owned()));
+        busy.set(true);
+        error_set(&write_error, None);
+        detached_write(
+            page,
+            async move { with_grant(live, || live.prompt(&id, &text)).await },
+            move |result| {
+                busy.set(false);
+                match result {
+                    Ok(()) => {
+                        draft.set(String::new());
+                        made.set(Some("Prompt sent.".to_owned()));
+                    }
+                    Err(err) => error_set(&write_error, Some(err)),
                 }
-                Err(err) => error_set(&write_error, Some(err)),
-            }
-        });
+            },
+        );
     };
-
+    let send_prompt = Rc::new(send_prompt);
+    let prompt_send = Rc::clone(&send_prompt);
+    let on_prompt = move || prompt_send(draft.get().trim().to_owned());
+    let submit_send = Rc::clone(&send_prompt);
+    let on_submit = move |text: &str| submit_send(text.trim().to_owned());
     let approve_id = id.clone();
     let on_approve = move || {
         let live = live;
         let id = approve_id.clone();
-        spawn(async move {
-            busy.set(true);
-            error_set(&write_error, None);
-            let result = with_grant(live, || live.approve(&id)).await;
-            busy.set(false);
-            if let Err(err) = result {
-                error_set(&write_error, Some(err));
-            }
-        });
+        busy.set(true);
+        error_set(&write_error, None);
+        detached_write(
+            page,
+            async move { with_grant(live, || live.approve(&id)).await },
+            move |result| {
+                busy.set(false);
+                if let Err(err) = result {
+                    error_set(&write_error, Some(err));
+                }
+            },
+        );
     };
-
     let deny_id = id.clone();
     let on_deny = move || {
         let answer = alert_dialog()
@@ -135,57 +146,68 @@ pub fn detail(nav: Nav, id: String) -> Screen {
             {
                 busy.set(true);
                 error_set(&write_error, None);
-                let result = with_grant(live, || live.deny(&id)).await;
+                detached_write(
+                    page,
+                    async move { with_grant(live, || live.deny(&id)).await },
+                    move |result| {
+                        busy.set(false);
+                        if let Err(err) = result {
+                            error_set(&write_error, Some(err));
+                        }
+                    },
+                );
+            }
+        });
+    };
+    let on_open_grant = move || {
+        let live = live;
+        busy.set(true);
+        error_set(&write_error, None);
+        detached_write(
+            page,
+            async move { live.open_grant().await },
+            move |result| {
                 busy.set(false);
                 if let Err(err) = result {
                     error_set(&write_error, Some(err));
                 }
-            }
-        });
+            },
+        );
     };
-
-    let on_open_grant = move || {
-        let live = live;
-        spawn(async move {
-            busy.set(true);
-            error_set(&write_error, None);
-            let result = live.open_grant().await;
-            busy.set(false);
-            if let Err(err) = result {
-                error_set(&write_error, Some(err));
-            }
-        });
-    };
-
     let worktree_id = id.clone();
     let on_worktree = move || {
         let live = live;
         let id = worktree_id.clone();
-        spawn(async move {
-            busy.set(true);
-            error_set(&write_error, None);
-            let request = live.snapshot.with_untracked(|snap| {
-                snap.as_ref()
-                    .and_then(|snap| snap.agent(&id))
-                    .map(|agent| WorktreeRequest {
-                        workspace_id: Some(agent.workspace_id.clone()),
-                        branch: Some("pendant-g2-wt-sim".to_owned()),
-                        ..Default::default()
-                    })
-            });
-            let Some(request) = request else {
+        busy.set(true);
+        error_set(&write_error, None);
+        detached_write(
+            page,
+            async move {
+                let request = live.snapshot.with_untracked(|snap| {
+                    snap.as_ref()
+                        .and_then(|snap| snap.agent(&id))
+                        .map(|agent| WorktreeRequest {
+                            workspace_id: Some(agent.workspace_id.clone()),
+                            branch: Some("pendant-g2-wt-sim".to_owned()),
+                            ..Default::default()
+                        })
+                });
+                let Some(request) = request else {
+                    return Err(WriteError::Net(NetError::Transport(
+                        "the agent is not in the snapshot".to_owned(),
+                    )));
+                };
+                with_grant(live, || live.worktree_create(&request)).await
+            },
+            move |result| {
                 busy.set(false);
-                return;
-            };
-            let result = with_grant(live, || live.worktree_create(&request)).await;
-            busy.set(false);
-            match result {
-                Ok(_) => made.set(Some("Worktree created.".to_owned())),
-                Err(err) => error_set(&write_error, Some(err)),
-            }
-        });
+                match result {
+                    Ok(_) => made.set(Some("Worktree created.".to_owned())),
+                    Err(err) => error_set(&write_error, Some(err)),
+                }
+            },
+        );
     };
-
     let body_id = id.clone();
     let write_id = id.clone();
     nav_page()
@@ -241,7 +263,8 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                                 made,
                                 write_error,
                                 enabled,
-                                on_prompt,
+                                on_prompt.clone(),
+                                on_submit.clone(),
                                 on_open_grant,
                                 on_worktree,
                             ))
@@ -469,6 +492,25 @@ async fn with_grant<T, F: Future<Output = Result<T, WriteError>>>(
     run().await
 }
 
+/// Runs a write outside the page's owner: leaving the page does not
+/// cancel it (a pairing task died exactly that way). The `settle` step
+/// touches the page's state only while the page still lives.
+fn detached_write<T>(
+    page: Owner,
+    future: impl Future<Output = T> + 'static,
+    settle: impl FnOnce(T) + 'static,
+) {
+    let (_owner, task) = create_root(move || {
+        spawn(async move {
+            let out = future.await;
+            if page.is_live() {
+                settle(out);
+            }
+        })
+    });
+    drop(task);
+}
+
 /// Sets the write error from a task.
 fn error_set(error: &Signal<Option<WriteError>>, value: Option<WriteError>) {
     error.set(value);
@@ -499,13 +541,12 @@ fn write_section(
     error: Signal<Option<WriteError>>,
     enabled: impl Fn() -> bool + Copy + 'static,
     on_prompt: impl Fn() + Clone + 'static,
+    on_submit: impl Fn(&str) + Clone + 'static,
     on_open_grant: impl Fn() + Copy + 'static,
     on_worktree: impl Fn() + Clone + 'static,
 ) -> impl IntoElement {
     let enabled_send = enabled;
     let enabled_wt = enabled;
-    let enabled_cond = enabled;
-    let enabled_grant = enabled;
     view()
         .flex_col()
         .gap_3()
@@ -539,7 +580,10 @@ fn write_section(
                 .value(move || draft.get())
                 .placeholder("Prompt the agent…")
                 .multiline(true)
+                .return_key_type(ReturnKeyType::Send)
+                .submit_behavior(SubmitBehavior::Submit)
                 .on_change(move |text: &str| draft.set(text.to_owned()))
+                .on_submit(on_submit)
                 .text_size(px(14.0))
                 .text_color(rgb(theme::TEXT)),
         )
@@ -563,12 +607,12 @@ fn write_section(
                 ))),
         )
         .child(when(
-            move || enabled_cond() && !live.grant_open(),
+            move || enabled() && !live.grant_open(),
             move || {
                 view().child(write_button(
                     "open-grant",
                     "Open grant",
-                    enabled_grant,
+                    enabled,
                     on_open_grant,
                     ButtonKind::Quiet,
                 ))
