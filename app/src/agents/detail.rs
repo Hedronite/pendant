@@ -572,16 +572,16 @@ fn write_section(
             .text_size(px(12.0))
             .text_color(rgb(theme::DIM)),
         )
-        .child(when(
-            move || made.get().is_some(),
-            move || {
-                text(move || made.get().unwrap_or_default())
-                    .test_id("made-note")
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(theme::TEAL))
-            },
-        ))
+        // Always one element: a when() here would re-create the input
+        // below when the note appears or goes, and the re-created field
+        // loses its on_change binding.
+        .child(
+            text(move || made.get().unwrap_or_default())
+                .test_id("made-note")
+                .text_size(px(13.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::TEAL)),
+        )
         .child(
             input()
                 .test_id("prompt-input")
@@ -614,18 +614,19 @@ fn write_section(
                     ButtonKind::Quiet,
                 ))),
         )
-        .child(when(
-            move || enabled() && !live.grant_open(),
-            move || {
-                view().child(write_button(
-                    "open-grant",
-                    "Open grant",
-                    enabled,
-                    on_open_grant,
-                    ButtonKind::Quiet,
-                ))
-            },
-        ))
+        .child(
+            // Always one row: a when() around this button would re-create
+            // the input above when the grant state flips, and the
+            // re-created field loses its on_change binding. The button
+            // stays and simply reads as unavailable while a grant is open.
+            view().child(write_button(
+                "open-grant",
+                "Open grant",
+                move || enabled() && !live.grant_open(),
+                on_open_grant,
+                ButtonKind::Quiet,
+            )),
+        )
         .child(write_note(move || error.get()))
 }
 
