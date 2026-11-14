@@ -85,7 +85,9 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     let enabled = move || !busy.get() && paired();
     let prompt_id = id.clone();
     let send_prompt = move |text: String| {
+        eprintln!("pendant: send_prompt fired");
         if text.is_empty() {
+            eprintln!("pendant: send_prompt empty text, dropped");
             return;
         }
         let live = live;
@@ -114,6 +116,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     let on_submit = move |text: &str| submit_send(text.trim().to_owned());
     let approve_id = id.clone();
     let on_approve = move || {
+        eprintln!("pendant: approve fired");
         let live = live;
         let id = approve_id.clone();
         busy.set(true);
@@ -131,6 +134,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     };
     let deny_id = id.clone();
     let on_deny = move || {
+        eprintln!("pendant: deny fired, asking to confirm");
         let answer = alert_dialog()
             .title("Deny the agent?")
             .description("The agent's waiting request is refused.")
@@ -140,10 +144,13 @@ pub fn detail(nav: Nav, id: String) -> Screen {
         let live = live;
         let id = deny_id.clone();
         spawn(async move {
-            if answer
+            let chosen = answer
                 .await
-                .is_ok_and(|r| r.action.as_deref() == Some("deny"))
-            {
+                .ok()
+                .and_then(|r| r.action)
+                .unwrap_or_else(|| "<dismissed>".into());
+            eprintln!("pendant: deny dialog answered {chosen}");
+            if chosen == "deny" {
                 busy.set(true);
                 error_set(&write_error, None);
                 detached_write(
@@ -160,6 +167,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
         });
     };
     let on_open_grant = move || {
+        eprintln!("pendant: open_grant fired");
         let live = live;
         busy.set(true);
         error_set(&write_error, None);
@@ -176,6 +184,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     };
     let worktree_id = id.clone();
     let on_worktree = move || {
+        eprintln!("pendant: worktree fired");
         let live = live;
         let id = worktree_id.clone();
         busy.set(true);
@@ -641,6 +650,12 @@ fn decision_bar(
     let enabled_deny = enabled;
     view()
         .test_id("decision-bar")
+        .on_layout(|frame: &Bounds<Points>| {
+            eprintln!(
+                "pendant: decision-bar layout {}x{} at {},{}",
+                frame.size.width.0, frame.size.height.0, frame.origin.x.0, frame.origin.y.0
+            );
+        })
         .flex_row()
         .gap_3()
         .p_4()

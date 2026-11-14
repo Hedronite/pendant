@@ -208,6 +208,7 @@ pub(crate) fn write_button(
         .py_2()
         .bg(rgb(bg))
         .on_press(move || {
+            eprintln!("pendant: press {id} enabled={}", press_enabled());
             if press_enabled() {
                 press();
             }
