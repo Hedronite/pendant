@@ -1,0 +1,32 @@
+# Scratch herdr session
+
+`seed.sh` starts a named herdr session that the bridge can read, with made-up
+content only. It exists so the app-shell checks have four agents, one of them
+blocked, without touching a live session or real notes.
+
+```bash
+scripts/scratch/seed.sh                # session pendant-shell-g1
+scripts/scratch/teardown.sh            # stop and delete it
+```
+
+The session lives at `~/.config/herdr/sessions/<name>/herdr.sock`. `seed.sh`
+prints the socket path and the agent summary, and refuses to seed a session
+that is already running.
+
+What it creates:
+
+- one workspace labelled `pendant-scratch`, four panes in a 2x2 split;
+- a marker line `PENDANT-SCRATCH-MARKER-<n>` in each pane;
+- four reported agents `scratch-1` … `scratch-4`, with `scratch-2` blocked.
+
+Each pane runs a reporter loop that re-reports its lifecycle state every
+couple of seconds. The state is transient by design: without the loop herdr
+drops a reported agent once the pane settles back at a plain shell prompt.
+
+Run the bridge against the session with:
+
+```bash
+PENDANT_HERDR_SOCK=~/.config/herdr/sessions/pendant-shell-g1/herdr.sock \
+PENDANT_SERVE_ORIGIN=https://<serve-host>:8443 \
+  cargo run -p pendant
+```
