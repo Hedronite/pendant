@@ -21,7 +21,9 @@ live one.
 
 What it creates:
 
-- one workspace labelled `pendant-scratch`, four panes in a 2x2 split;
+- a made-up git repo at `/tmp/pendant-scratch-repo` (one commit, one fixture
+  file, a scratch identity) so the workspace can create a worktree;
+- one workspace labelled `pendant-scratch` on that repo, four panes in a 2x2 split;
 - a marker line `PENDANT-SCRATCH-MARKER-<n>` in each pane;
 - four reported agents `scratch-1` … `scratch-4`, with `scratch-2` blocked;
 - a `PENDANT-SCRATCH-TICK-<n>` line in pane 1 every couple of seconds, so

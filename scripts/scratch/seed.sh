@@ -14,6 +14,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 SESSION="$(scratch_session_name "$@")" || exit 1
 LABEL="${PENDANT_SCRATCH_LABEL:-pendant-scratch}"
+REPO_DIR="${PENDANT_SCRATCH_REPO:-/tmp/pendant-scratch-repo}"
 HERDR="${HERDR_BIN:-$(command -v herdr)}"
 TICKER_INDEX=1
 BLOCKED_INDEX=2
@@ -43,7 +44,22 @@ if [ "$workspaces" != "0" ]; then
     exit 1
 fi
 
-root="$(h workspace create --label "$LABEL" --cwd /tmp --no-focus |
+seed_repo() {
+    mkdir -p "$REPO_DIR"
+    if [ -d "$REPO_DIR/.git" ]; then
+        return 0
+    fi
+    git -C "$REPO_DIR" init -q -b main
+    printf '# Scratch fixture\n\nMade-up content for the worktree check. No real notes.\n' \
+        >"$REPO_DIR/FIXTURE.md"
+    git -C "$REPO_DIR" -c user.name=scratch -c user.email=scratch@example.invalid \
+        add -A
+    git -C "$REPO_DIR" -c user.name=scratch -c user.email=scratch@example.invalid \
+        commit -qm "scratch fixture"
+}
+seed_repo
+
+root="$(h workspace create --label "$LABEL" --cwd "$REPO_DIR" --no-focus |
     jq -r '.result.root_pane.pane_id')"
 split() { h pane split "$1" --direction "$2" --no-focus | jq -r '.result.pane.pane_id'; }
 second="$(split "$root" right)"
@@ -74,7 +90,7 @@ for _ in $(seq 1 100); do
     if printf '%s' "$summary" |
         jq -e '.agents | length == 4 and (map(select(.agent_status == "blocked")) | length) == 1' \
             >/dev/null; then
-        printf 'session=%s\nsocket=%s\n%s\n' "$SESSION" "$SOCK" "$summary"
+        printf 'session=%s\nsocket=%s\nrepo=%s\n%s\n' "$SESSION" "$SOCK" "$REPO_DIR" "$summary"
         exit 0
     fi
     sleep 0.1
