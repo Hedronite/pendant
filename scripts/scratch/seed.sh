@@ -18,6 +18,9 @@ REPO_DIR="${PENDANT_SCRATCH_REPO:-/tmp/pendant-scratch-repo}"
 HERDR="${HERDR_BIN:-$(command -v herdr)}"
 TICKER_INDEX=1
 BLOCKED_INDEX=2
+# Lifecycle reports must carry the detected agent label, or herdr stops
+# treating the pane as a promptable agent. It is the symlink name.
+AGENT_NAME=claude
 REFRESH_SECONDS=2
 SOCK="$HOME/.config/herdr/sessions/$SESSION/herdr.sock"
 
@@ -88,20 +91,16 @@ for index in "${!panes[@]}"; do
     # system directories only; no inherited PATH, no operator shell.
     command="$(printf 'exec env -i HOME=%q PATH=%q HERDR_BIN=%q PENDANT_AGENT_NAME=%q TICK_PANE=%q REFRESH_SECONDS=%q claude %q %q %q %q' \
         "$HOME" "$BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin" "$HERDR" \
-        "scratch-$number" "$TICKER_INDEX" "$REFRESH_SECONDS" \
+        "$AGENT_NAME" "$TICKER_INDEX" "$REFRESH_SECONDS" \
         "$number" "$state" "$SESSION" "$pane")"
     h pane run "$pane" "$command" >/dev/null
 done
 
-# Detection is asynchronous. Wait for four agents, then give each a scratch
-# display name so the fixture reads as fixture.
+# Detection is asynchronous: wait until herdr sees four agents in the session.
 for _ in $(seq 1 100); do
     detected="$(h api snapshot | jq '.result.snapshot.agents | length')"
     [ "$detected" = "4" ] && break
     sleep 0.1
-done
-for index in "${!panes[@]}"; do
-    h agent rename "${panes[$index]}" "scratch-$((index + 1))" >/dev/null 2>&1 || true
 done
 
 for _ in $(seq 1 100); do

@@ -12,12 +12,13 @@ state="$2"
 session="$3"
 pane="$4"
 herdr="${HERDR_BIN:-herdr}"
-agent_name="${PENDANT_AGENT_NAME:-scratch-$number}"
+agent_name="${PENDANT_AGENT_NAME:-claude}"
 tick_pane="${TICK_PANE:-0}"
 refresh="${REFRESH_SECONDS:-2}"
 
-# Typed input is reported, not echoed twice.
-stty -echo 2>/dev/null || true
+# Typed input is reported, not echoed twice, and single keys (the approve bar)
+# must arrive without waiting for Enter.
+stty -echo -icanon min 1 time 0 2>/dev/null || true
 
 # Erase the operator prompt and the command echo before the first fixture line.
 printf '\033[3J\033[2J\033[H'
@@ -42,21 +43,40 @@ bar() {
 [ "$state" = "blocked" ] && bar
 
 tick=0
+buffer=""
 while :; do
-    if IFS= read -r -t "$refresh" line; then
-        printf 'PENDANT-SCRATCH-INPUT: %s\n' "$line"
-        if [ "$state" = "blocked" ]; then
-            case "$line" in
-                y | Y)
-                    printf 'PENDANT-SCRATCH-DECISION: approve\n'
+    if IFS= read -r -n 1 -t "$refresh" ch; then
+        case "$ch" in
+            $'\r' | $'\n')
+                if [ -n "$buffer" ]; then
+                    printf 'PENDANT-SCRATCH-INPUT: %s\n' "$buffer"
+                    buffer=""
+                fi
+                ;;
+            y | Y | n | N)
+                # Single keys, from the approve bar, arrive without Enter.
+                if [ "$state" = "blocked" ]; then
+                    case "$ch" in
+                        y | Y) printf 'PENDANT-SCRATCH-DECISION: approve\n' ;;
+                        n | N) printf 'PENDANT-SCRATCH-DECISION: deny\n' ;;
+                    esac
                     bar
-                    ;;
-                n | N)
-                    printf 'PENDANT-SCRATCH-DECISION: deny\n'
-                    bar
-                    ;;
-            esac
-        fi
+                    buffer=""
+                else
+                    buffer="$buffer$ch"
+                fi
+                ;;
+            *)
+                buffer="$buffer$ch"
+                if [ "${#buffer}" -gt 200 ]; then
+                    buffer="${buffer: -200}"
+                fi
+                ;;
+        esac
+    elif [ -n "$buffer" ]; then
+        # A prompt that arrives without a trailing newline still gets reported.
+        printf 'PENDANT-SCRATCH-INPUT: %s\n' "$buffer"
+        buffer=""
     fi
     if [ "$number" = "$tick_pane" ]; then
         tick=$((tick + 1))
