@@ -3,8 +3,9 @@
 use nsh_base::nav_page;
 use nsh_core::prelude::*;
 
-use crate::agents::{error_line, link_line, status_pill};
+use crate::agents::{error_line, link_line, status_pill, unpaired_banner};
 use crate::net::live::live;
+use crate::net::pair::PairState;
 use crate::theme;
 use crate::{Nav, Route};
 
@@ -49,6 +50,10 @@ pub fn list(nav: Nav) -> Screen {
                 .flex_col()
                 .bg(rgb(theme::GRAPHITE))
                 .child(link_line(move || live.link.get()))
+                .child(when(
+                    move || matches!(live.pairing.get(), PairState::Unpaired { .. }),
+                    move || unpaired_banner(nav),
+                ))
                 .child(
                     view()
                         .flex_row()
@@ -82,7 +87,16 @@ pub fn list(nav: Nav) -> Screen {
                                 .with(|snap| snap.as_ref().map_or(0, |snap| snap.agents.len()))
                         },
                         move |at| {
+                            let row_id = live
+                                .snapshot
+                                .with(|snap| {
+                                    snap.as_ref()
+                                        .and_then(|snap| snap.agents.get(at.index()).cloned())
+                                        .map(|agent| format!("agent-row-{}", agent.id))
+                                })
+                                .unwrap_or_default();
                             view()
+                                .test_id(row_id.as_str())
                                 .h(px(56.0))
                                 .flex_row()
                                 .items_center()
@@ -128,6 +142,7 @@ pub fn list(nav: Nav) -> Screen {
                                 }))
                         },
                     )
+                    .content_padding_bottom(safe_area().bottom)
                     .estimated_item_size(px(56.0))
                     .keys(move || {
                         live.snapshot.with(|snap| {

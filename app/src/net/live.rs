@@ -25,8 +25,9 @@ use tungstenite::http::HeaderValue;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Connector, Message, WebSocket};
 
+use super::pair::{self, Decision, PairState, Payload, WorktreeRequest, WriteError};
 use super::ws::{Down, Frame, SeqTrack, Up};
-use super::{Bridge, InboxItem, Snapshot};
+use super::{Bridge, InboxItem, NetError, Snapshot};
 
 /// How often the snapshot and the inbox are fetched again.
 pub const POLL: Duration = Duration::from_secs(3);
@@ -78,6 +79,10 @@ pub struct Live {
     pub error: Signal<Option<String>>,
     /// Watched panes by pane id.
     pub panes: Signal<BTreeMap<String, PaneFeed>>,
+    /// This device's pairing with the bridge.
+    pub pairing: Signal<PairState>,
+    /// Until when the app treats its write grant as open; `None`: closed.
+    pub grant_until: Signal<Option<Instant>>,
 }
 
 enum Cmd {
@@ -93,6 +98,11 @@ enum Event {
 thread_local! {
     /// The worker's command channel, owned by the engine thread.
     static COMMANDS: RefCell<Option<Sender<Cmd>>> = const { RefCell::new(None) };
+    /// The root's owner, where [`Live::spawn_detached`] runs tasks.
+    static ROOT: RefCell<Option<Owner>> = const { RefCell::new(None) };
+    /// Detached tasks still running, by id; each removes itself when done.
+    static DETACHED: RefCell<Vec<(u64, Spawned<()>)>> = const { RefCell::new(Vec::new()) };
+    static NEXT_DETACHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Live {
@@ -115,11 +125,171 @@ impl Live {
         });
     }
 
+    /// Runs `future` to its end under the app's root, not the caller's
+    /// page: leaving the page does not cancel it. Its task handle is kept
+    /// until it finishes (dropping an nsh task handle cancels the task).
+    /// For a write the person started: check the page is still there before
+    /// touching its signals.
+    pub fn spawn_detached(&self, future: impl std::future::Future<Output = ()> + 'static) {
+        spawn_detached(future);
+    }
+
     /// Blocked items in the inbox.
     pub fn blocked(&self) -> usize {
         self.inbox
             .with(|items| items.iter().filter(|item| item.is_blocked()).count())
     }
+
+    /// Whether a grant is open now. Not reactive in time: read it when a
+    /// write is about to start, or tick a signal to redraw a countdown.
+    pub fn grant_open(&self) -> bool {
+        self.grant_until
+            .get_untracked()
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Pairs this device from the payload text (paste or deep link).
+    /// Biometric: once.
+    pub async fn pair(&self, payload: &str) -> Result<(), WriteError> {
+        self.pair_with(&Payload::parse(payload)?).await
+    }
+
+    /// Pairs from a payload already parsed (a `pendant://pair` link).
+    pub async fn pair_with(&self, payload: &Payload) -> Result<(), WriteError> {
+        let bridge = bridge()?;
+        self.pairing.set(PairState::Pairing);
+        trace("pair: sending");
+        match pair::pair(&bridge, payload).await {
+            Ok(device_id) => {
+                trace(&format!("pair: paired {device_id}"));
+                pair::store_device(Some(&device_id));
+                self.pairing.set(PairState::Paired { device_id });
+                Ok(())
+            }
+            Err(err) => {
+                trace(&format!("pair: refused: {err}"));
+                self.pairing.set(PairState::Unpaired {
+                    reason: Some(err.to_string()),
+                });
+                Err(err)
+            }
+        }
+    }
+
+    /// Opens a write grant for the next [`pair::GRANT_WINDOW`]. Biometric: once.
+    pub async fn open_grant(&self) -> Result<(), WriteError> {
+        trace("grant: requesting");
+        let device = self
+            .device()
+            .inspect_err(|err| trace(&format!("grant: {err}")))?;
+        let result = pair::open_grant(&bridge()?, &device).await;
+        match &result {
+            Ok(()) => {
+                trace("grant: open");
+                self.grant_until
+                    .set(Some(Instant::now() + pair::GRANT_WINDOW));
+            }
+            Err(err) => trace(&format!("grant: refused: {err}")),
+        }
+        self.settle(result)
+    }
+
+    /// Sends `text` to the agent's pane. Biometric: once.
+    pub async fn prompt(&self, agent: &str, text: &str) -> Result<(), WriteError> {
+        trace(&format!("write prompt {agent}: requesting"));
+        let device = self.device()?;
+        let result = pair::prompt(&bridge()?, &device, agent, text).await;
+        trace(&format!("write prompt {agent}: {}", outcome(&result)));
+        self.settle(result).map(drop)
+    }
+
+    /// Approve (`y`) for a blocked agent. Biometric: once.
+    pub async fn approve(&self, agent: &str) -> Result<(), WriteError> {
+        self.decide(agent, Decision::Approve).await
+    }
+
+    /// Deny (`n`) for a blocked agent. Biometric: once.
+    pub async fn deny(&self, agent: &str) -> Result<(), WriteError> {
+        self.decide(agent, Decision::Deny).await
+    }
+
+    async fn decide(&self, agent: &str, decision: Decision) -> Result<(), WriteError> {
+        trace(&format!("write {decision:?} {agent}: requesting"));
+        let device = self.device()?;
+        let result = pair::decide(&bridge()?, &device, agent, decision).await;
+        trace(&format!("write {decision:?} {agent}: {}", outcome(&result)));
+        self.settle(result).map(drop)
+    }
+
+    /// Creates a worktree; returns herdr's reply. Biometric: once.
+    pub async fn worktree_create(
+        &self,
+        request: &WorktreeRequest,
+    ) -> Result<serde_json::Value, WriteError> {
+        trace("write worktree: requesting");
+        let device = self.device()?;
+        let result = pair::worktree_create(&bridge()?, &device, request).await;
+        trace(&format!("write worktree: {}", outcome(&result)));
+        self.settle(result)
+    }
+
+    fn device(&self) -> Result<String, WriteError> {
+        match self.pairing.get_untracked() {
+            PairState::Paired { device_id } => Ok(device_id),
+            _ => {
+                trace("write: not paired here");
+                Err(WriteError::Unpaired)
+            }
+        }
+    }
+
+    /// Applies what a refusal says about the pairing and the grant.
+    fn settle<T>(&self, result: Result<T, WriteError>) -> Result<T, WriteError> {
+        match &result {
+            Err(WriteError::Unpaired) => {
+                trace("pairing dropped: the bridge refused this device");
+                pair::store_device(None);
+                self.grant_until.set(None);
+                self.pairing.set(PairState::Unpaired {
+                    reason: Some("the bridge no longer accepts this device".into()),
+                });
+            }
+            Err(WriteError::GrantRequired | WriteError::GrantReleased) => {
+                self.grant_until.set(None);
+            }
+            _ => {}
+        }
+        result
+    }
+}
+
+fn bridge() -> Result<Bridge, WriteError> {
+    crate::bridge().map_err(|err| WriteError::Net(NetError::Transport(err.to_string())))
+}
+
+fn outcome<T>(result: &Result<T, WriteError>) -> String {
+    match result {
+        Ok(_) => "ok".to_owned(),
+        Err(err) => format!("refused: {err}"),
+    }
+}
+
+/// [`Live::spawn_detached`] without a `Live` at hand (an event handler).
+pub fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static) {
+    let id = NEXT_DETACHED.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    });
+    let run = async move {
+        future.await;
+        DETACHED.with(|tasks| tasks.borrow_mut().retain(|(task, _)| *task != id));
+    };
+    let spawned = ROOT.with(|root| match root.borrow().as_ref() {
+        Some(owner) => owner.run(|| spawn(run)),
+        None => spawn(run),
+    });
+    DETACHED.with(|tasks| tasks.borrow_mut().push((id, spawned)));
 }
 
 fn command(cmd: Cmd) {
@@ -147,8 +317,20 @@ pub fn start() -> Live {
         inbox: signal(Vec::new()),
         error: signal(None),
         panes: signal(BTreeMap::new()),
+        pairing: signal(match pair::stored_device() {
+            Some(device_id) => PairState::Paired { device_id },
+            None => PairState::Unpaired { reason: None },
+        }),
+        grant_until: signal(None),
     };
     provide_context(live);
+    ROOT.with(|root| *root.borrow_mut() = Some(Owner::current()));
+    // Which build is running: the commit given at build time, so a run's
+    // log names the exact app it tested.
+    trace(&format!(
+        "build {}",
+        option_env!("PENDANT_BUILD_SHA").unwrap_or("dev")
+    ));
     let bridge = match crate::bridge() {
         Ok(bridge) => bridge,
         Err(err) => {
@@ -244,11 +426,20 @@ pub fn apply(panes: &mut BTreeMap<String, PaneFeed>, down: Down) {
 }
 
 /// One line to the platform log (logcat on Android) and, on iOS, to the
-/// app's stderr, which `simctl launch --console` shows.
+/// app's stderr (`simctl launch --console`) and the unified log.
 pub(crate) fn trace(line: &str) {
     log::info!(target: "pendant", "{line}");
     #[cfg(target_os = "ios")]
-    eprintln!("pendant: {line}");
+    {
+        eprintln!("pendant: {line}");
+        // The unified log too (`log stream` on the simulator): stderr is
+        // not kept when a UI test launches the app. Lines never carry a
+        // pairing payload, a key or a signature.
+        if let Ok(text) = std::ffi::CString::new(format!("pendant: {line}")) {
+            // SAFETY: a constant "%s" format with one NUL-terminated string.
+            unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), text.as_ptr()) };
+        }
+    }
 }
 
 // The worker thread.

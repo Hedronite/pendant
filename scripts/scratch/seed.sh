@@ -14,9 +14,13 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 SESSION="$(scratch_session_name "$@")" || exit 1
 LABEL="${PENDANT_SCRATCH_LABEL:-pendant-scratch}"
+REPO_DIR="${PENDANT_SCRATCH_REPO:-/tmp/pendant-scratch-repo}"
 HERDR="${HERDR_BIN:-$(command -v herdr)}"
 TICKER_INDEX=1
 BLOCKED_INDEX=2
+# Lifecycle reports must carry the detected agent label, or herdr stops
+# treating the pane as a promptable agent. It is the symlink name.
+AGENT_NAME=claude
 REFRESH_SECONDS=2
 SOCK="$HOME/.config/herdr/sessions/$SESSION/herdr.sock"
 
@@ -43,7 +47,22 @@ if [ "$workspaces" != "0" ]; then
     exit 1
 fi
 
-root="$(h workspace create --label "$LABEL" --cwd /tmp --no-focus |
+seed_repo() {
+    mkdir -p "$REPO_DIR"
+    if [ -d "$REPO_DIR/.git" ]; then
+        return 0
+    fi
+    git -C "$REPO_DIR" init -q -b main
+    printf '# Scratch fixture\n\nMade-up content for the worktree check. No real notes.\n' \
+        >"$REPO_DIR/FIXTURE.md"
+    git -C "$REPO_DIR" -c user.name=scratch -c user.email=scratch@example.invalid \
+        add -A
+    git -C "$REPO_DIR" -c user.name=scratch -c user.email=scratch@example.invalid \
+        commit -qm "scratch fixture"
+}
+seed_repo
+
+root="$(h workspace create --label "$LABEL" --cwd "$REPO_DIR" --no-focus |
     jq -r '.result.root_pane.pane_id')"
 split() { h pane split "$1" --direction "$2" --no-focus | jq -r '.result.pane.pane_id'; }
 second="$(split "$root" right)"
@@ -52,20 +71,36 @@ fourth="$(split "$second" down)"
 panes=("$root" "$second" "$third" "$fourth")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PANE_RUNNER="$SCRIPT_DIR/pane.sh"
+AGENT_SCRIPT="$SCRIPT_DIR/agent.sh"
+# herdr detects an agent by the foreground process name, so the pane runs the
+# fixture through a symlink deliberately named after a supported agent. The
+# directory is fresh per seed, holds only that symlink, is prepended to the
+# pane PATH only, and teardown removes it.
+BIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pendant-scratch-bin.XXXXXX")"
+ln -s "$AGENT_SCRIPT" "$BIN_DIR/claude"
+BIN_STATE="$HOME/.config/herdr/sessions/$SESSION/scratch-bin.path"
+printf '%s\n' "$BIN_DIR" >"$BIN_STATE"
 
 for index in "${!panes[@]}"; do
     pane="${panes[$index]}"
     number=$((index + 1))
     state=idle
     [ "$number" -eq "$BLOCKED_INDEX" ] && state=blocked
-    # The runner erases this typed line and the prompt before printing anything,
-    # so the pane holds fixture text only. env -i plus --noprofile --norc keeps
-    # the operator's shell out of it.
-    command="$(printf 'exec env -i HOME=%q PATH=%q HERDR_BIN=%q TICK_PANE=%q REFRESH_SECONDS=%q bash --noprofile --norc %q %q %q %q %q' \
-        "$HOME" "$PATH" "$HERDR" "$TICKER_INDEX" "$REFRESH_SECONDS" \
-        "$PANE_RUNNER" "$number" "$state" "$SESSION" "$pane")"
+    # The agent erases this typed line and the prompt before printing anything,
+    # so the pane holds fixture text only. env -i with the scratch bin first and
+    # system directories only; no inherited PATH, no operator shell.
+    command="$(printf 'exec env -i HOME=%q PATH=%q HERDR_BIN=%q PENDANT_AGENT_NAME=%q TICK_PANE=%q REFRESH_SECONDS=%q claude %q %q %q %q' \
+        "$HOME" "$BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin" "$HERDR" \
+        "$AGENT_NAME" "$TICKER_INDEX" "$REFRESH_SECONDS" \
+        "$number" "$state" "$SESSION" "$pane")"
     h pane run "$pane" "$command" >/dev/null
+done
+
+# Detection is asynchronous: wait until herdr sees four agents in the session.
+for _ in $(seq 1 100); do
+    detected="$(h api snapshot | jq '.result.snapshot.agents | length')"
+    [ "$detected" = "4" ] && break
+    sleep 0.1
 done
 
 for _ in $(seq 1 100); do
@@ -74,7 +109,7 @@ for _ in $(seq 1 100); do
     if printf '%s' "$summary" |
         jq -e '.agents | length == 4 and (map(select(.agent_status == "blocked")) | length) == 1' \
             >/dev/null; then
-        printf 'session=%s\nsocket=%s\n%s\n' "$SESSION" "$SOCK" "$summary"
+        printf 'session=%s\nsocket=%s\nrepo=%s\n%s\n' "$SESSION" "$SOCK" "$REPO_DIR" "$summary"
         exit 0
     fi
     sleep 0.1

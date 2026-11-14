@@ -7,6 +7,7 @@
 //! `PENDANT_BRIDGE_URL=https://bridge.example.ts.net:8443 nsh package …`.
 
 pub mod live;
+pub mod pair;
 pub mod types;
 pub mod ws;
 

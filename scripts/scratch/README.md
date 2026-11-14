@@ -21,21 +21,34 @@ live one.
 
 What it creates:
 
-- one workspace labelled `pendant-scratch`, four panes in a 2x2 split;
+- a made-up git repo at `/tmp/pendant-scratch-repo` (one commit, one fixture
+  file, a scratch identity) so the workspace can create a worktree;
+- one workspace labelled `pendant-scratch` on that repo, four panes in a 2x2 split;
 - a marker line `PENDANT-SCRATCH-MARKER-<n>` in each pane;
-- four reported agents `scratch-1` … `scratch-4`, with `scratch-2` blocked;
+- four detected agents, all labelled with the harness name herdr recognises, with
+  the pane-2 agent blocked (ids are the pane ids `w1:p1` … `w1:p4`);
 - a `PENDANT-SCRATCH-TICK-<n>` line in pane 1 every couple of seconds, so
-  herdr keeps emitting frames for the WebSocket link.
+  herdr keeps emitting frames for the WebSocket link;
+- on the blocked pane, a `PENDANT-SCRATCH-APPROVE [y/n]` bar, and
+  `PENDANT-SCRATCH-DECISION: approve|deny` when a key arrives;
+- `PENDANT-SCRATCH-INPUT: <line>` for anything sent to a pane; a line without a
+  trailing newline is reported on the next idle tick.
 
-Each pane runs a reporter loop that re-reports its lifecycle state every
-couple of seconds. The state is transient by design: without the loop herdr
-drops a reported agent once the pane settles back at a plain shell prompt.
+herdr only treats a pane as an agent it can prompt when the foreground process
+matches a known harness. `agent.sh` is that process: a bash fixture that runs no
+model, opens no network and reads no tokens. Each seed makes a fresh
+`mktemp -d` directory holding one symlink to it, named after a supported agent,
+and prepends only that directory to the pane's `env -i` PATH; teardown removes
+the directory. Detection is asynchronous, so `seed.sh` waits for four agents.
+Reports carry the detected label: reporting a different name stops herdr treating
+the pane as a promptable agent.
 
-The loop lives in `pane.sh`, which each pane starts through `env -i` and a
-`bash --noprofile --norc`. Before its first line it erases the operator prompt,
-the echo of the command that started it, and any startup noise, and it never
-returns to a shell. So a pane's text is only its marker (and the ticker on
-pane 1): no username, hostname, home path or binary path.
+The agent re-reports its lifecycle state every couple of seconds. The state is
+transient by design: without the loop herdr drops a reported agent once the pane
+settles. Before its first line the agent erases the operator prompt, the echo of
+the command that started it, and any startup noise, and it never returns to a
+shell — so a pane's text is only fixture lines: no username, hostname, home path
+or binary path.
 
 Run the bridge against the session with:
 

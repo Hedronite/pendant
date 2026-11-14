@@ -5,6 +5,12 @@
   "build": 1,
   "rust": ".",
   "root": "App",
+  "schemes": ["pendant"],
+  "ios": {
+    "infoPlist": {
+      "NSFaceIDUsageDescription": "Pendant asks for Face ID before it pairs this device or acts on your agents."
+    }
+  },
   "capabilities": {
     "network": {
       "hosts": ["*.ts.net"]

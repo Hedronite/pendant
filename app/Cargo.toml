@@ -26,6 +26,8 @@ tungstenite = { version = "0.28", default-features = false, features = ["handsha
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
 log = "0.4"
+# Device keys and signatures go over the wire as base64 (the bridge decodes STANDARD).
+base64 = "0.22"
 
 # The notes store is host-only until D1: the phone app has no Lapis link
 # (SPEC-shell). CI still builds and tests it on the host.
@@ -39,6 +41,23 @@ lapis-notes = { git = "https://github.com/Hedronite/lapis-lattice", rev = "42aa3
 # NSURLIsExcludedFromBackupKey on the index directory (iOS, and macOS dev hosts).
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSValue"] }
+
+# iOS only: the app's trace lines also go to syslog (the unified log).
+[target.'cfg(target_os = "ios")'.dependencies]
+libc = "0.2"
+
+# Android only: the Keystore key goes through JNI (the same jni line as nsh's
+# Android platform) and finds the VM with dlsym.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+libc = "0.2"
+
+# The iOS simulator only: a LocalAuthentication check before each device-key
+# signature (see platform/keystore.rs). Not in device builds.
+[target.'cfg(all(target_os = "ios", target_abi = "sim"))'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext", "LAPublicDefines", "LAError"] }
 
 [dev-dependencies]
 # Same major as lapis-lattice's, so it unifies: the tests read the index file.

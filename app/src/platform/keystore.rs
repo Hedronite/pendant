@@ -1,19 +1,26 @@
 //! The phone's device key for pairing.
 //!
-//! The key is made on the phone and never leaves it. On iOS it is a P-256 key
-//! in the Secure Enclave, stored in the Keychain under [`TAG`], usable only
-//! while the device is unlocked, never synced or backed up, and each signature
-//! needs a biometric match from the currently enrolled set. Nothing here
-//! writes the key to a file, and nothing ships one: the repo holds no key.
+//! The key is made on the phone and never leaves it. Nothing here writes the
+//! key to a file, and nothing ships one: the repo holds no key.
+//!
+//! - **iOS devices (and macOS hosts):** a P-256 key in the Secure Enclave,
+//!   stored in the Keychain under [`TAG`], usable only while the device is
+//!   unlocked, never synced or backed up, and each signature needs a
+//!   biometric match from the currently enrolled set. This is the only
+//!   stored key an `aarch64-apple-ios` build can make.
+//! - **The iOS simulator (`target_abi = "sim"`):** it has no Secure Enclave,
+//!   so the key is a Keychain P-256 key with the same biometric access
+//!   control. That code is compiled for the simulator target only. A
+//!   simulator biometric never passes pairing G1a, which needs a phone.
 //!
 //! The wire format the bridge verifies is [`ALGORITHM`]:
 //! - public key: the SEC1 uncompressed point, 65 bytes, `0x04 || X || Y`;
 //! - signature: ECDSA over SHA-256 of the message, ASN.1 DER (X9.62).
 //!
-//! Android Keystore is not reachable from here. Its key generation and
-//! `BiometricPrompt` are Java APIs that need the app's `Context` and a
-//! foreground `Activity`, and there is no app shell yet to own them, so every
-//! call on Android returns [`KeyError::Unsupported`].
+//! - **Android:** an Android Keystore P-256 key (`AndroidKeyStore`, strong
+//!   biometric for every use) that signs only after a `BiometricPrompt`
+//!   match, through `android/PendantKey.java` (see the Android `imp`).
+//!   Emulator biometrics never pass pairing G1a either.
 
 use std::fmt;
 
@@ -67,7 +74,7 @@ impl DeviceKey {
         if imp::Key::stored(None)?.is_some() {
             return Err(KeyError::Exists);
         }
-        DeviceKey::wrap(imp::Key::generate(imp::Protection::Device)?)
+        DeviceKey::wrap(imp::Key::generate(imp::Protection::STORED)?)
     }
 
     /// The stored device key, if there is one. Reading it needs no biometric.
@@ -121,6 +128,7 @@ mod imp {
     const UTF8: u32 = 0x0800_0100;
     const SINT32: CFIndex = 3;
     const BIOMETRY_CURRENT_SET: usize = 1 << 3;
+    #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
     const PRIVATE_KEY_USAGE: usize = 1 << 30;
     const ERR_ITEM_NOT_FOUND: OSStatus = -25300;
     const ERR_USER_CANCELED: i64 = -128;
@@ -163,8 +171,6 @@ mod imp {
         static kSecAttrKeySizeInBits: CFTypeRef;
         static kSecAttrKeyClass: CFTypeRef;
         static kSecAttrKeyClassPrivate: CFTypeRef;
-        static kSecAttrTokenID: CFTypeRef;
-        static kSecAttrTokenIDSecureEnclave: CFTypeRef;
         static kSecAttrIsPermanent: CFTypeRef;
         static kSecAttrApplicationTag: CFTypeRef;
         static kSecAttrAccessControl: CFTypeRef;
@@ -191,6 +197,14 @@ mod imp {
         ) -> CFTypeRef;
         fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> OSStatus;
         fn SecItemDelete(query: CFTypeRef) -> OSStatus;
+    }
+
+    // The Secure Enclave token: every Apple target but the simulator.
+    #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecAttrTokenID: CFTypeRef;
+        static kSecAttrTokenIDSecureEnclave: CFTypeRef;
     }
 
     #[cfg(test)]
@@ -307,9 +321,25 @@ mod imp {
         }
     }
 
+    /// The iOS simulator reads an app's entitlements from its executable's
+    /// `__TEXT,__entitlements` section, as Xcode links them, not from an ad
+    /// hoc signature (which may not carry these). The Keychain needs an
+    /// application identifier and an access group under it. Simulator only.
+    #[cfg(all(target_os = "ios", target_abi = "sim"))]
+    #[used]
+    #[link_section = "__TEXT,__entitlements"]
+    static SIM_ENTITLEMENTS: [u8; include_bytes!("sim-entitlements.plist").len()] =
+        *include_bytes!("sim-entitlements.plist");
+
     pub(super) enum Protection {
-        /// Secure Enclave, stored in the Keychain, biometric to sign.
+        /// Secure Enclave, stored in the Keychain, biometric to sign. Every
+        /// Apple target but the iOS simulator.
+        #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
         Device,
+        /// The iOS simulator only: a Keychain P-256 key (no Secure Enclave
+        /// there), stored, biometric to sign. Not compiled for devices.
+        #[cfg(all(target_os = "ios", target_abi = "sim"))]
+        SimulatorKeychain,
         /// A software key held in memory only, so the FFI can run on a host
         /// without a Secure Enclave entitlement. Never shipped.
         #[cfg(test)]
@@ -317,9 +347,18 @@ mod imp {
     }
 
     impl Protection {
+        /// The stored device key's protection on this target.
+        #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
+        pub(super) const STORED: Protection = Protection::Device;
+        #[cfg(all(target_os = "ios", target_abi = "sim"))]
+        pub(super) const STORED: Protection = Protection::SimulatorKeychain;
+
         fn held(&self) -> bool {
             match self {
+                #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
                 Protection::Device => false,
+                #[cfg(all(target_os = "ios", target_abi = "sim"))]
+                Protection::SimulatorKeychain => false,
                 #[cfg(test)]
                 Protection::Memory => true,
             }
@@ -342,6 +381,7 @@ mod imp {
             // `err` is a valid out slot and, when set, is owned by `error`.
             unsafe {
                 let params = match protection {
+                    #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
                     Protection::Device => {
                         let access = Cf::owned(SecAccessControlCreateWithFlags(
                             ptr::null(),
@@ -359,6 +399,32 @@ mod imp {
                             (kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom),
                             (kSecAttrKeySizeInBits, bits.as_ptr()),
                             (kSecAttrTokenID, kSecAttrTokenIDSecureEnclave),
+                            (kSecUseDataProtectionKeychain, kCFBooleanTrue),
+                            (kSecPrivateKeyAttrs, private.as_ptr()),
+                        ])
+                    }
+                    // No token: the simulator has no Secure Enclave. The
+                    // biometric access control is the device key's, without
+                    // PrivateKeyUsage, which only an enclave key takes.
+                    #[cfg(all(target_os = "ios", target_abi = "sim"))]
+                    Protection::SimulatorKeychain => {
+                        // Keeps the entitlements section in the linked app.
+                        std::hint::black_box(&SIM_ENTITLEMENTS);
+                        let access = Cf::owned(SecAccessControlCreateWithFlags(
+                            ptr::null(),
+                            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                            BIOMETRY_CURRENT_SET,
+                            &mut err,
+                        ))
+                        .ok_or_else(|| error(err))?;
+                        let private = dict(&[
+                            (kSecAttrIsPermanent, kCFBooleanTrue),
+                            (kSecAttrApplicationTag, tag.as_ptr()),
+                            (kSecAttrAccessControl, access.as_ptr()),
+                        ]);
+                        dict(&[
+                            (kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom),
+                            (kSecAttrKeySizeInBits, bits.as_ptr()),
                             (kSecUseDataProtectionKeychain, kCFBooleanTrue),
                             (kSecPrivateKeyAttrs, private.as_ptr()),
                         ])
@@ -455,6 +521,13 @@ mod imp {
         }
 
         pub(super) fn sign(&self, message: &[u8], reason: &str) -> Result<Vec<u8>, KeyError> {
+            // The simulator's Keychain signed with this key without asking
+            // for Face ID, its biometric access control notwithstanding, so
+            // on the simulator each signature first passes LocalAuthentication.
+            #[cfg(all(target_os = "ios", target_abi = "sim"))]
+            if self.held.is_none() {
+                sim_biometric(reason)?;
+            }
             let private = self.private(Some(reason))?;
             let message = data(message);
             let mut err: CFTypeRef = ptr::null();
@@ -471,6 +544,43 @@ mod imp {
                 .ok_or_else(|| error(err))?;
                 Ok(signature.bytes())
             }
+        }
+    }
+
+    /// A Face ID (or Touch ID) match through LocalAuthentication, on the
+    /// simulator only. Blocks the calling thread, never the UI thread: the
+    /// key is only used from a worker thread.
+    #[cfg(all(target_os = "ios", target_abi = "sim"))]
+    fn sim_biometric(reason: &str) -> Result<(), KeyError> {
+        use objc2::runtime::Bool;
+        use objc2_foundation::{NSError, NSString};
+        use objc2_local_authentication::{LAContext, LAPolicy};
+
+        const LA_USER_CANCEL: isize = -2;
+        const LA_AUTH_FAILED: isize = -1;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = block2::RcBlock::new(move |ok: Bool, err: *mut NSError| {
+            // SAFETY: LocalAuthentication passes a live NSError or null.
+            let code = unsafe { err.as_ref() }.map_or(0, |err| err.code());
+            let _ = tx.send((ok.as_bool(), code));
+        });
+        // SAFETY: a fresh context, a policy constant, a live NSString and a
+        // block that outlives the call (LocalAuthentication copies it).
+        unsafe {
+            let context = LAContext::new();
+            context.evaluatePolicy_localizedReason_reply(
+                LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
+                &NSString::from_str(reason),
+                &reply,
+            );
+        }
+        match rx.recv() {
+            Ok((true, _)) => Ok(()),
+            Ok((false, LA_USER_CANCEL)) => Err(KeyError::Cancelled),
+            Ok((false, LA_AUTH_FAILED)) => Err(KeyError::AuthFailed),
+            Ok((false, code)) => Err(KeyError::Os(code as i64)),
+            Err(_) => Err(KeyError::Os(0)),
         }
     }
 
@@ -511,17 +621,299 @@ mod imp {
     }
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(target_os = "android")]
+mod imp {
+    //! Android Keystore through `android/PendantKey.java`, compiled to dex
+    //! by `build.rs` and embedded here. The dex is loaded once with
+    //! `InMemoryDexClassLoader` under the app's own class loader: threads
+    //! that Rust starts see only the system class loader, and nsh 0.5.0 has
+    //! no hook for an app's Java. Every call runs on the calling (worker)
+    //! thread, attached to the VM for the call.
+
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    use jni::objects::{GlobalRef, JByteArray, JClass, JValue};
+    use jni::sys::{jint, jsize};
+    use jni::{JNIEnv, JavaVM};
+
+    use super::{KeyError, TAG};
+
+    static DEX: &[u8] = include_bytes!(env!("PENDANT_KEY_DEX"));
+    const CLASS: &str = "com.hedronite.pendant.PendantKey";
+
+    // BiometricPrompt's codes that mean the person stopped, or could not
+    // authenticate.
+    const USER_CANCELED: i32 = 10;
+    const NEGATIVE_BUTTON: i32 = 13;
+    const CANCELED: i32 = 5;
+    const LOCKOUT: i32 = 7;
+    const LOCKOUT_PERMANENT: i32 = 9;
+    const NO_BIOMETRICS: i32 = 11;
+    const HW_NOT_PRESENT: i32 = 12;
+
+    pub(super) enum Protection {
+        Device,
+    }
+
+    impl Protection {
+        pub(super) const STORED: Protection = Protection::Device;
+    }
+
+    pub(super) struct Key;
+
+    type GetVms = unsafe extern "system" fn(*mut *mut jni::sys::JavaVM, jsize, *mut jsize) -> jint;
+
+    /// The process's VM, through `JNI_GetCreatedJavaVMs` (libnativehelper,
+    /// else ART itself).
+    fn vm() -> Result<&'static JavaVM, KeyError> {
+        static VM: OnceLock<Option<JavaVM>> = OnceLock::new();
+        VM.get_or_init(|| {
+            for lib in [c"libnativehelper.so", c"libart.so"] {
+                // SAFETY: dlopen/dlsym with NUL-terminated names; the
+                // libraries are already loaded in an app process, so this
+                // only takes another reference.
+                let get = unsafe {
+                    let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
+                    if handle.is_null() {
+                        continue;
+                    }
+                    libc::dlsym(handle, c"JNI_GetCreatedJavaVMs".as_ptr() as *const c_char)
+                };
+                if get.is_null() {
+                    continue;
+                }
+                // SAFETY: the symbol has JNI's documented signature.
+                let get: GetVms = unsafe { std::mem::transmute::<*mut c_void, GetVms>(get) };
+                let mut raw: *mut jni::sys::JavaVM = std::ptr::null_mut();
+                let mut count: jsize = 0;
+                // SAFETY: room for one VM; an Android process has exactly one.
+                if unsafe { get(&mut raw, 1, &mut count) } == jni::sys::JNI_OK && count == 1 {
+                    // SAFETY: a live VM pointer from the runtime.
+                    return unsafe { JavaVM::from_raw(raw) }.ok();
+                }
+            }
+            None
+        })
+        .as_ref()
+        .ok_or(KeyError::Os(-10))
+    }
+
+    /// `PendantKey`, loaded once from the embedded dex.
+    fn class(env: &mut JNIEnv) -> Result<&'static GlobalRef, KeyError> {
+        static CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
+        if let Some(class) = CLASS_REF.get() {
+            return Ok(class);
+        }
+        let loaded = load_class(env).map_err(|_| java_failed(env))?;
+        Ok(CLASS_REF.get_or_init(|| loaded))
+    }
+
+    fn load_class(env: &mut JNIEnv) -> jni::errors::Result<GlobalRef> {
+        let app = env
+            .call_static_method(
+                "android/app/ActivityThread",
+                "currentApplication",
+                "()Landroid/app/Application;",
+                &[],
+            )?
+            .l()?;
+        let parent = env
+            .call_method(&app, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .l()?;
+        let bytes = env.byte_array_from_slice(DEX)?;
+        let buffer = env
+            .call_static_method(
+                "java/nio/ByteBuffer",
+                "wrap",
+                "([B)Ljava/nio/ByteBuffer;",
+                &[JValue::Object(&bytes)],
+            )?
+            .l()?;
+        let loader = env.new_object(
+            "dalvik/system/InMemoryDexClassLoader",
+            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+            &[JValue::Object(&buffer), JValue::Object(&parent)],
+        )?;
+        let name = env.new_string(CLASS)?;
+        let class = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        env.new_global_ref(class)
+    }
+
+    /// Clears a pending Java exception; the call failed.
+    fn java_failed(env: &mut JNIEnv) -> KeyError {
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        KeyError::Os(-11)
+    }
+
+    /// Runs `f` with an attached env and the class.
+    fn with_class<T>(
+        f: impl FnOnce(&mut JNIEnv, &JClass) -> jni::errors::Result<T>,
+    ) -> Result<T, KeyError> {
+        let vm = vm()?;
+        let mut env = vm.attach_current_thread().map_err(|_| KeyError::Os(-12))?;
+        let global = class(&mut env)?;
+        let local = env
+            .new_local_ref(global.as_obj())
+            .map_err(|_| java_failed(&mut env))?;
+        let class = JClass::from(local);
+        let result = f(&mut env, &class);
+        result.map_err(|_| java_failed(&mut env))
+    }
+
+    fn last_error(env: &mut JNIEnv, class: &JClass) -> jni::errors::Result<i32> {
+        env.get_static_field(class, "lastError", "I")?.i()
+    }
+
+    /// A BiometricPrompt or PendantKey code as a key error.
+    fn refusal(code: i32) -> KeyError {
+        match code {
+            USER_CANCELED | NEGATIVE_BUTTON | CANCELED => KeyError::Cancelled,
+            LOCKOUT | LOCKOUT_PERMANENT | NO_BIOMETRICS | HW_NOT_PRESENT => KeyError::AuthFailed,
+            other => KeyError::Os(other.into()),
+        }
+    }
+
+    impl Key {
+        pub(super) fn generate(_: Protection) -> Result<Key, KeyError> {
+            let (ok, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let ok = env
+                    .call_static_method(
+                        class,
+                        "create",
+                        "(Ljava/lang/String;)Z",
+                        &[JValue::Object(&alias)],
+                    )?
+                    .z()?;
+                Ok((ok, last_error(env, class)?))
+            })?;
+            if ok {
+                Ok(Key)
+            } else {
+                Err(refusal(code))
+            }
+        }
+
+        pub(super) fn stored(_: Option<&str>) -> Result<Option<Key>, KeyError> {
+            let (exists, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let exists = env
+                    .call_static_method(
+                        class,
+                        "exists",
+                        "(Ljava/lang/String;)Z",
+                        &[JValue::Object(&alias)],
+                    )?
+                    .z()?;
+                Ok((exists, last_error(env, class)?))
+            })?;
+            match (exists, code) {
+                (true, _) => Ok(Some(Key)),
+                (false, 0) => Ok(None),
+                (false, code) => Err(refusal(code)),
+            }
+        }
+
+        pub(super) fn delete() -> Result<(), KeyError> {
+            let (ok, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let ok = env
+                    .call_static_method(
+                        class,
+                        "delete",
+                        "(Ljava/lang/String;)Z",
+                        &[JValue::Object(&alias)],
+                    )?
+                    .z()?;
+                Ok((ok, last_error(env, class)?))
+            })?;
+            if ok {
+                Ok(())
+            } else {
+                Err(refusal(code))
+            }
+        }
+
+        /// The SEC1 point: the last 65 bytes of the SubjectPublicKeyInfo
+        /// Java returns for a P-256 key.
+        pub(super) fn public_key(&self) -> Result<Vec<u8>, KeyError> {
+            let (spki, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let array = env
+                    .call_static_method(
+                        class,
+                        "publicKey",
+                        "(Ljava/lang/String;)[B",
+                        &[JValue::Object(&alias)],
+                    )?
+                    .l()?;
+                let code = last_error(env, class)?;
+                if array.is_null() {
+                    return Ok((None, code));
+                }
+                Ok((Some(env.convert_byte_array(JByteArray::from(array))?), code))
+            })?;
+            let spki = spki.ok_or_else(|| refusal(code))?;
+            sec1_point(&spki).ok_or(KeyError::Os(-13))
+        }
+
+        pub(super) fn sign(&self, message: &[u8], reason: &str) -> Result<Vec<u8>, KeyError> {
+            let (signature, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let bytes = env.byte_array_from_slice(message)?;
+                let title = env.new_string(reason)?;
+                let array = env
+                    .call_static_method(
+                        class,
+                        "sign",
+                        "(Ljava/lang/String;[BLjava/lang/String;)[B",
+                        &[
+                            JValue::Object(&alias),
+                            JValue::Object(&bytes),
+                            JValue::Object(&title),
+                        ],
+                    )?
+                    .l()?;
+                let code = last_error(env, class)?;
+                if array.is_null() {
+                    return Ok((None, code));
+                }
+                Ok((Some(env.convert_byte_array(JByteArray::from(array))?), code))
+            })?;
+            signature.ok_or_else(|| refusal(code))
+        }
+    }
+
+    /// The uncompressed point at the end of a P-256 SubjectPublicKeyInfo:
+    /// a BIT STRING whose 65 content bytes start with 0x04.
+    pub(super) fn sec1_point(spki: &[u8]) -> Option<Vec<u8>> {
+        let point = spki.get(spki.len().checked_sub(65)?..)?;
+        (point[0] == 0x04 && spki.len() == 91).then(|| point.to_vec())
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 mod imp {
     use super::KeyError;
 
-    #[cfg(target_os = "android")]
-    const WHY: &str = "Android Keystore and BiometricPrompt need the app shell";
-    #[cfg(not(target_os = "android"))]
     const WHY: &str = "not a phone";
 
     pub(super) enum Protection {
         Device,
+    }
+
+    impl Protection {
+        pub(super) const STORED: Protection = Protection::Device;
     }
 
     pub(super) struct Key;
@@ -595,7 +987,7 @@ mod tests {
         assert!(DeviceKey::load().unwrap().is_none());
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     #[test]
     fn other_platforms_say_unsupported() {
         assert!(matches!(DeviceKey::create(), Err(KeyError::Unsupported(_))));
