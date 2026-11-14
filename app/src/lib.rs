@@ -90,13 +90,35 @@ pub fn bridge() -> Result<net::Bridge, net::ConfigError> {
     net::Bridge::from_build()
 }
 
+/// The variable naming a page to open over the list at launch.
+pub const START_VAR: &str = "PENDANT_START";
+
+/// The stack at launch: the agent list, plus the page `start` names
+/// (`inbox` or `agent:<id>`), read from [`START_VAR`] at run time. A
+/// simulator launch passes it as `SIMCTL_CHILD_PENDANT_START`, so a check
+/// can open a page without taps. Anything else opens the list alone.
+pub fn start_routes(start: Option<&str>) -> Vec<Route> {
+    let mut routes = vec![Route::Agents];
+    match start.map(str::trim) {
+        Some("inbox") => routes.push(Route::Inbox),
+        Some(other) => {
+            if let Some(id) = other.strip_prefix("agent:").filter(|id| !id.is_empty()) {
+                routes.push(Route::Agent(id.to_owned()));
+            }
+        }
+        None => {}
+    }
+    routes
+}
+
 /// The root component.
 #[component]
 pub fn App() -> impl IntoElement {
     // The live link: snapshot and inbox polling, and the WebSocket worker.
     // Screens read it with `net::live::live()`.
     net::live::start();
-    let routes = signal(vec![Route::Agents]);
+    let start = std::env::var(START_VAR).ok();
+    let routes = signal(start_routes(start.as_deref()));
     let nav = Nav { routes };
     nav_stack().flex_1().child(each(
         move || routes.get(),
@@ -112,4 +134,22 @@ pub fn App() -> impl IntoElement {
             page.on_dismiss(move || routes.update(|r| r.truncate(index.get_untracked().max(1))))
         },
     ))
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::{start_routes, Route};
+
+    #[test]
+    fn the_start_variable_opens_one_page_over_the_list() {
+        assert_eq!(start_routes(None), [Route::Agents]);
+        assert_eq!(start_routes(Some("inbox")), [Route::Agents, Route::Inbox]);
+        assert_eq!(
+            start_routes(Some("agent:w1:p2")),
+            [Route::Agents, Route::Agent("w1:p2".into())]
+        );
+        for ignored in ["", "agent:", "agents", "settings", "agent"] {
+            assert_eq!(start_routes(Some(ignored)), [Route::Agents], "{ignored}");
+        }
+    }
 }
