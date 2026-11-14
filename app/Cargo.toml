@@ -42,6 +42,13 @@ lapis-notes = { git = "https://github.com/Hedronite/lapis-lattice", rev = "42aa3
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSValue"] }
 
+# The iOS simulator only: a LocalAuthentication check before each device-key
+# signature (see platform/keystore.rs). Not in device builds.
+[target.'cfg(all(target_os = "ios", target_abi = "sim"))'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext", "LAPublicDefines", "LAError"] }
+
 [dev-dependencies]
 # Same major as lapis-lattice's, so it unifies: the tests read the index file.
 rusqlite = "0.42"

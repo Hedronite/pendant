@@ -1,19 +1,23 @@
 //! The phone's device key for pairing.
 //!
-//! The key is made on the phone and never leaves it. On iOS it is a P-256 key
-//! in the Secure Enclave, stored in the Keychain under [`TAG`], usable only
-//! while the device is unlocked, never synced or backed up, and each signature
-//! needs a biometric match from the currently enrolled set. Nothing here
-//! writes the key to a file, and nothing ships one: the repo holds no key.
+//! The key is made on the phone and never leaves it. Nothing here writes the
+//! key to a file, and nothing ships one: the repo holds no key.
+//!
+//! - **iOS devices (and macOS hosts):** a P-256 key in the Secure Enclave,
+//!   stored in the Keychain under [`TAG`], usable only while the device is
+//!   unlocked, never synced or backed up, and each signature needs a
+//!   biometric match from the currently enrolled set. This is the only
+//!   stored key an `aarch64-apple-ios` build can make.
+//! - **The iOS simulator (`target_abi = "sim"`):** it has no Secure Enclave,
+//!   so the key is a Keychain P-256 key with the same biometric access
+//!   control. That code is compiled for the simulator target only. A
+//!   simulator biometric never passes pairing G1a, which needs a phone.
 //!
 //! The wire format the bridge verifies is [`ALGORITHM`]:
 //! - public key: the SEC1 uncompressed point, 65 bytes, `0x04 || X || Y`;
 //! - signature: ECDSA over SHA-256 of the message, ASN.1 DER (X9.62).
 //!
-//! Android Keystore is not reachable from here. Its key generation and
-//! `BiometricPrompt` are Java APIs that need the app's `Context` and a
-//! foreground `Activity`, and there is no app shell yet to own them, so every
-//! call on Android returns [`KeyError::Unsupported`].
+//! Android is not implemented here yet and returns [`KeyError::Unsupported`].
 
 use std::fmt;
 
@@ -67,7 +71,7 @@ impl DeviceKey {
         if imp::Key::stored(None)?.is_some() {
             return Err(KeyError::Exists);
         }
-        DeviceKey::wrap(imp::Key::generate(imp::Protection::Device)?)
+        DeviceKey::wrap(imp::Key::generate(imp::Protection::STORED)?)
     }
 
     /// The stored device key, if there is one. Reading it needs no biometric.
@@ -121,6 +125,7 @@ mod imp {
     const UTF8: u32 = 0x0800_0100;
     const SINT32: CFIndex = 3;
     const BIOMETRY_CURRENT_SET: usize = 1 << 3;
+    #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
     const PRIVATE_KEY_USAGE: usize = 1 << 30;
     const ERR_ITEM_NOT_FOUND: OSStatus = -25300;
     const ERR_USER_CANCELED: i64 = -128;
@@ -163,8 +168,6 @@ mod imp {
         static kSecAttrKeySizeInBits: CFTypeRef;
         static kSecAttrKeyClass: CFTypeRef;
         static kSecAttrKeyClassPrivate: CFTypeRef;
-        static kSecAttrTokenID: CFTypeRef;
-        static kSecAttrTokenIDSecureEnclave: CFTypeRef;
         static kSecAttrIsPermanent: CFTypeRef;
         static kSecAttrApplicationTag: CFTypeRef;
         static kSecAttrAccessControl: CFTypeRef;
@@ -191,6 +194,14 @@ mod imp {
         ) -> CFTypeRef;
         fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> OSStatus;
         fn SecItemDelete(query: CFTypeRef) -> OSStatus;
+    }
+
+    // The Secure Enclave token: every Apple target but the simulator.
+    #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecAttrTokenID: CFTypeRef;
+        static kSecAttrTokenIDSecureEnclave: CFTypeRef;
     }
 
     #[cfg(test)]
@@ -307,9 +318,25 @@ mod imp {
         }
     }
 
+    /// The iOS simulator reads an app's entitlements from its executable's
+    /// `__TEXT,__entitlements` section, as Xcode links them, not from an ad
+    /// hoc signature (which may not carry these). The Keychain needs an
+    /// application identifier and an access group under it. Simulator only.
+    #[cfg(all(target_os = "ios", target_abi = "sim"))]
+    #[used]
+    #[link_section = "__TEXT,__entitlements"]
+    static SIM_ENTITLEMENTS: [u8; include_bytes!("sim-entitlements.plist").len()] =
+        *include_bytes!("sim-entitlements.plist");
+
     pub(super) enum Protection {
-        /// Secure Enclave, stored in the Keychain, biometric to sign.
+        /// Secure Enclave, stored in the Keychain, biometric to sign. Every
+        /// Apple target but the iOS simulator.
+        #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
         Device,
+        /// The iOS simulator only: a Keychain P-256 key (no Secure Enclave
+        /// there), stored, biometric to sign. Not compiled for devices.
+        #[cfg(all(target_os = "ios", target_abi = "sim"))]
+        SimulatorKeychain,
         /// A software key held in memory only, so the FFI can run on a host
         /// without a Secure Enclave entitlement. Never shipped.
         #[cfg(test)]
@@ -317,9 +344,18 @@ mod imp {
     }
 
     impl Protection {
+        /// The stored device key's protection on this target.
+        #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
+        pub(super) const STORED: Protection = Protection::Device;
+        #[cfg(all(target_os = "ios", target_abi = "sim"))]
+        pub(super) const STORED: Protection = Protection::SimulatorKeychain;
+
         fn held(&self) -> bool {
             match self {
+                #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
                 Protection::Device => false,
+                #[cfg(all(target_os = "ios", target_abi = "sim"))]
+                Protection::SimulatorKeychain => false,
                 #[cfg(test)]
                 Protection::Memory => true,
             }
@@ -342,6 +378,7 @@ mod imp {
             // `err` is a valid out slot and, when set, is owned by `error`.
             unsafe {
                 let params = match protection {
+                    #[cfg(not(all(target_os = "ios", target_abi = "sim")))]
                     Protection::Device => {
                         let access = Cf::owned(SecAccessControlCreateWithFlags(
                             ptr::null(),
@@ -359,6 +396,32 @@ mod imp {
                             (kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom),
                             (kSecAttrKeySizeInBits, bits.as_ptr()),
                             (kSecAttrTokenID, kSecAttrTokenIDSecureEnclave),
+                            (kSecUseDataProtectionKeychain, kCFBooleanTrue),
+                            (kSecPrivateKeyAttrs, private.as_ptr()),
+                        ])
+                    }
+                    // No token: the simulator has no Secure Enclave. The
+                    // biometric access control is the device key's, without
+                    // PrivateKeyUsage, which only an enclave key takes.
+                    #[cfg(all(target_os = "ios", target_abi = "sim"))]
+                    Protection::SimulatorKeychain => {
+                        // Keeps the entitlements section in the linked app.
+                        std::hint::black_box(&SIM_ENTITLEMENTS);
+                        let access = Cf::owned(SecAccessControlCreateWithFlags(
+                            ptr::null(),
+                            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                            BIOMETRY_CURRENT_SET,
+                            &mut err,
+                        ))
+                        .ok_or_else(|| error(err))?;
+                        let private = dict(&[
+                            (kSecAttrIsPermanent, kCFBooleanTrue),
+                            (kSecAttrApplicationTag, tag.as_ptr()),
+                            (kSecAttrAccessControl, access.as_ptr()),
+                        ]);
+                        dict(&[
+                            (kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom),
+                            (kSecAttrKeySizeInBits, bits.as_ptr()),
                             (kSecUseDataProtectionKeychain, kCFBooleanTrue),
                             (kSecPrivateKeyAttrs, private.as_ptr()),
                         ])
@@ -455,6 +518,13 @@ mod imp {
         }
 
         pub(super) fn sign(&self, message: &[u8], reason: &str) -> Result<Vec<u8>, KeyError> {
+            // The simulator's Keychain signed with this key without asking
+            // for Face ID, its biometric access control notwithstanding, so
+            // on the simulator each signature first passes LocalAuthentication.
+            #[cfg(all(target_os = "ios", target_abi = "sim"))]
+            if self.held.is_none() {
+                sim_biometric(reason)?;
+            }
             let private = self.private(Some(reason))?;
             let message = data(message);
             let mut err: CFTypeRef = ptr::null();
@@ -471,6 +541,43 @@ mod imp {
                 .ok_or_else(|| error(err))?;
                 Ok(signature.bytes())
             }
+        }
+    }
+
+    /// A Face ID (or Touch ID) match through LocalAuthentication, on the
+    /// simulator only. Blocks the calling thread, never the UI thread: the
+    /// key is only used from a worker thread.
+    #[cfg(all(target_os = "ios", target_abi = "sim"))]
+    fn sim_biometric(reason: &str) -> Result<(), KeyError> {
+        use objc2::runtime::Bool;
+        use objc2_foundation::{NSError, NSString};
+        use objc2_local_authentication::{LAContext, LAPolicy};
+
+        const LA_USER_CANCEL: isize = -2;
+        const LA_AUTH_FAILED: isize = -1;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = block2::RcBlock::new(move |ok: Bool, err: *mut NSError| {
+            // SAFETY: LocalAuthentication passes a live NSError or null.
+            let code = unsafe { err.as_ref() }.map_or(0, |err| err.code());
+            let _ = tx.send((ok.as_bool(), code));
+        });
+        // SAFETY: a fresh context, a policy constant, a live NSString and a
+        // block that outlives the call (LocalAuthentication copies it).
+        unsafe {
+            let context = LAContext::new();
+            context.evaluatePolicy_localizedReason_reply(
+                LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
+                &NSString::from_str(reason),
+                &reply,
+            );
+        }
+        match rx.recv() {
+            Ok((true, _)) => Ok(()),
+            Ok((false, LA_USER_CANCEL)) => Err(KeyError::Cancelled),
+            Ok((false, LA_AUTH_FAILED)) => Err(KeyError::AuthFailed),
+            Ok((false, code)) => Err(KeyError::Os(code as i64)),
+            Err(_) => Err(KeyError::Os(0)),
         }
     }
 
