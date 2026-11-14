@@ -1,7 +1,7 @@
 //! Pairing and signed writes, as the bridge's `pairing.rs` and its write
 //! routes verify them.
 //!
-//! - **Pair:** the payload the bridge shows on castle (`pendant-pair:v1:<nonce>`)
+//! - **Pair:** the payload the bridge host shows (`pendant-pair:v1:<nonce>`)
 //!   is a one-time secret. The device key signs `pendant-pair:v1` over the
 //!   device id, its public key and the nonce, and `POST /v1/pair` stores the
 //!   key. Takeover is off: while one device is paired, another is refused.
