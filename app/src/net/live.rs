@@ -164,18 +164,25 @@ impl Live {
 
     /// Opens a write grant for the next [`pair::GRANT_WINDOW`]. Biometric: once.
     pub async fn open_grant(&self) -> Result<(), WriteError> {
-        let device = self.device()?;
+        trace("grant: requesting");
+        let device = self
+            .device()
+            .inspect_err(|err| trace(&format!("grant: {err}")))?;
         let result = pair::open_grant(&bridge()?, &device).await;
-        if result.is_ok() {
-            trace("grant: open");
-            self.grant_until
-                .set(Some(Instant::now() + pair::GRANT_WINDOW));
+        match &result {
+            Ok(()) => {
+                trace("grant: open");
+                self.grant_until
+                    .set(Some(Instant::now() + pair::GRANT_WINDOW));
+            }
+            Err(err) => trace(&format!("grant: refused: {err}")),
         }
         self.settle(result)
     }
 
     /// Sends `text` to the agent's pane. Biometric: once.
     pub async fn prompt(&self, agent: &str, text: &str) -> Result<(), WriteError> {
+        trace(&format!("write prompt {agent}: requesting"));
         let device = self.device()?;
         let result = pair::prompt(&bridge()?, &device, agent, text).await;
         trace(&format!("write prompt {agent}: {}", outcome(&result)));
@@ -193,6 +200,7 @@ impl Live {
     }
 
     async fn decide(&self, agent: &str, decision: Decision) -> Result<(), WriteError> {
+        trace(&format!("write {decision:?} {agent}: requesting"));
         let device = self.device()?;
         let result = pair::decide(&bridge()?, &device, agent, decision).await;
         trace(&format!("write {decision:?} {agent}: {}", outcome(&result)));
@@ -204,6 +212,7 @@ impl Live {
         &self,
         request: &WorktreeRequest,
     ) -> Result<serde_json::Value, WriteError> {
+        trace("write worktree: requesting");
         let device = self.device()?;
         let result = pair::worktree_create(&bridge()?, &device, request).await;
         trace(&format!("write worktree: {}", outcome(&result)));
@@ -213,7 +222,10 @@ impl Live {
     fn device(&self) -> Result<String, WriteError> {
         match self.pairing.get_untracked() {
             PairState::Paired { device_id } => Ok(device_id),
-            _ => Err(WriteError::Unpaired),
+            _ => {
+                trace("write: not paired here");
+                Err(WriteError::Unpaired)
+            }
         }
     }
 
