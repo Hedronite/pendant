@@ -17,7 +17,10 @@
 //! - public key: the SEC1 uncompressed point, 65 bytes, `0x04 || X || Y`;
 //! - signature: ECDSA over SHA-256 of the message, ASN.1 DER (X9.62).
 //!
-//! Android is not implemented here yet and returns [`KeyError::Unsupported`].
+//! - **Android:** an Android Keystore P-256 key (`AndroidKeyStore`, strong
+//!   biometric for every use) that signs only after a `BiometricPrompt`
+//!   match, through `android/PendantKey.java` (see the Android `imp`).
+//!   Emulator biometrics never pass pairing G1a either.
 
 use std::fmt;
 
@@ -618,17 +621,299 @@ mod imp {
     }
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(target_os = "android")]
+mod imp {
+    //! Android Keystore through `android/PendantKey.java`, compiled to dex
+    //! by `build.rs` and embedded here. The dex is loaded once with
+    //! `InMemoryDexClassLoader` under the app's own class loader: threads
+    //! that Rust starts see only the system class loader, and nsh 0.5.0 has
+    //! no hook for an app's Java. Every call runs on the calling (worker)
+    //! thread, attached to the VM for the call.
+
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    use jni::objects::{GlobalRef, JByteArray, JClass, JValue};
+    use jni::sys::{jint, jsize};
+    use jni::{JNIEnv, JavaVM};
+
+    use super::{KeyError, TAG};
+
+    static DEX: &[u8] = include_bytes!(env!("PENDANT_KEY_DEX"));
+    const CLASS: &str = "com.hedronite.pendant.PendantKey";
+
+    // BiometricPrompt's codes that mean the person stopped, or could not
+    // authenticate.
+    const USER_CANCELED: i32 = 10;
+    const NEGATIVE_BUTTON: i32 = 13;
+    const CANCELED: i32 = 5;
+    const LOCKOUT: i32 = 7;
+    const LOCKOUT_PERMANENT: i32 = 9;
+    const NO_BIOMETRICS: i32 = 11;
+    const HW_NOT_PRESENT: i32 = 12;
+
+    pub(super) enum Protection {
+        Device,
+    }
+
+    impl Protection {
+        pub(super) const STORED: Protection = Protection::Device;
+    }
+
+    pub(super) struct Key;
+
+    type GetVms = unsafe extern "system" fn(*mut *mut jni::sys::JavaVM, jsize, *mut jsize) -> jint;
+
+    /// The process's VM, through `JNI_GetCreatedJavaVMs` (libnativehelper,
+    /// else ART itself).
+    fn vm() -> Result<&'static JavaVM, KeyError> {
+        static VM: OnceLock<Option<JavaVM>> = OnceLock::new();
+        VM.get_or_init(|| {
+            for lib in [c"libnativehelper.so", c"libart.so"] {
+                // SAFETY: dlopen/dlsym with NUL-terminated names; the
+                // libraries are already loaded in an app process, so this
+                // only takes another reference.
+                let get = unsafe {
+                    let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
+                    if handle.is_null() {
+                        continue;
+                    }
+                    libc::dlsym(handle, c"JNI_GetCreatedJavaVMs".as_ptr() as *const c_char)
+                };
+                if get.is_null() {
+                    continue;
+                }
+                // SAFETY: the symbol has JNI's documented signature.
+                let get: GetVms = unsafe { std::mem::transmute::<*mut c_void, GetVms>(get) };
+                let mut raw: *mut jni::sys::JavaVM = std::ptr::null_mut();
+                let mut count: jsize = 0;
+                // SAFETY: room for one VM; an Android process has exactly one.
+                if unsafe { get(&mut raw, 1, &mut count) } == jni::sys::JNI_OK && count == 1 {
+                    // SAFETY: a live VM pointer from the runtime.
+                    return unsafe { JavaVM::from_raw(raw) }.ok();
+                }
+            }
+            None
+        })
+        .as_ref()
+        .ok_or(KeyError::Os(-10))
+    }
+
+    /// `PendantKey`, loaded once from the embedded dex.
+    fn class(env: &mut JNIEnv) -> Result<&'static GlobalRef, KeyError> {
+        static CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
+        if let Some(class) = CLASS_REF.get() {
+            return Ok(class);
+        }
+        let loaded = load_class(env).map_err(|_| java_failed(env))?;
+        Ok(CLASS_REF.get_or_init(|| loaded))
+    }
+
+    fn load_class(env: &mut JNIEnv) -> jni::errors::Result<GlobalRef> {
+        let app = env
+            .call_static_method(
+                "android/app/ActivityThread",
+                "currentApplication",
+                "()Landroid/app/Application;",
+                &[],
+            )?
+            .l()?;
+        let parent = env
+            .call_method(&app, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .l()?;
+        let bytes = env.byte_array_from_slice(DEX)?;
+        let buffer = env
+            .call_static_method(
+                "java/nio/ByteBuffer",
+                "wrap",
+                "([B)Ljava/nio/ByteBuffer;",
+                &[JValue::Object(&bytes)],
+            )?
+            .l()?;
+        let loader = env.new_object(
+            "dalvik/system/InMemoryDexClassLoader",
+            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+            &[JValue::Object(&buffer), JValue::Object(&parent)],
+        )?;
+        let name = env.new_string(CLASS)?;
+        let class = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        env.new_global_ref(class)
+    }
+
+    /// Clears a pending Java exception; the call failed.
+    fn java_failed(env: &mut JNIEnv) -> KeyError {
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        KeyError::Os(-11)
+    }
+
+    /// Runs `f` with an attached env and the class.
+    fn with_class<T>(
+        f: impl FnOnce(&mut JNIEnv, &JClass) -> jni::errors::Result<T>,
+    ) -> Result<T, KeyError> {
+        let vm = vm()?;
+        let mut env = vm.attach_current_thread().map_err(|_| KeyError::Os(-12))?;
+        let global = class(&mut env)?;
+        let local = env
+            .new_local_ref(global.as_obj())
+            .map_err(|_| java_failed(&mut env))?;
+        let class = JClass::from(local);
+        let result = f(&mut env, &class);
+        result.map_err(|_| java_failed(&mut env))
+    }
+
+    fn last_error(env: &mut JNIEnv, class: &JClass) -> jni::errors::Result<i32> {
+        env.get_static_field(class, "lastError", "I")?.i()
+    }
+
+    /// A BiometricPrompt or PendantKey code as a key error.
+    fn refusal(code: i32) -> KeyError {
+        match code {
+            USER_CANCELED | NEGATIVE_BUTTON | CANCELED => KeyError::Cancelled,
+            LOCKOUT | LOCKOUT_PERMANENT | NO_BIOMETRICS | HW_NOT_PRESENT => KeyError::AuthFailed,
+            other => KeyError::Os(other.into()),
+        }
+    }
+
+    impl Key {
+        pub(super) fn generate(_: Protection) -> Result<Key, KeyError> {
+            let (ok, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let ok = env
+                    .call_static_method(
+                        class,
+                        "create",
+                        "(Ljava/lang/String;)Z",
+                        &[JValue::Object(&alias)],
+                    )?
+                    .z()?;
+                Ok((ok, last_error(env, class)?))
+            })?;
+            if ok {
+                Ok(Key)
+            } else {
+                Err(refusal(code))
+            }
+        }
+
+        pub(super) fn stored(_: Option<&str>) -> Result<Option<Key>, KeyError> {
+            let (exists, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let exists = env
+                    .call_static_method(
+                        class,
+                        "exists",
+                        "(Ljava/lang/String;)Z",
+                        &[JValue::Object(&alias)],
+                    )?
+                    .z()?;
+                Ok((exists, last_error(env, class)?))
+            })?;
+            match (exists, code) {
+                (true, _) => Ok(Some(Key)),
+                (false, 0) => Ok(None),
+                (false, code) => Err(refusal(code)),
+            }
+        }
+
+        pub(super) fn delete() -> Result<(), KeyError> {
+            let (ok, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let ok = env
+                    .call_static_method(
+                        class,
+                        "delete",
+                        "(Ljava/lang/String;)Z",
+                        &[JValue::Object(&alias)],
+                    )?
+                    .z()?;
+                Ok((ok, last_error(env, class)?))
+            })?;
+            if ok {
+                Ok(())
+            } else {
+                Err(refusal(code))
+            }
+        }
+
+        /// The SEC1 point: the last 65 bytes of the SubjectPublicKeyInfo
+        /// Java returns for a P-256 key.
+        pub(super) fn public_key(&self) -> Result<Vec<u8>, KeyError> {
+            let (spki, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let array = env
+                    .call_static_method(
+                        class,
+                        "publicKey",
+                        "(Ljava/lang/String;)[B",
+                        &[JValue::Object(&alias)],
+                    )?
+                    .l()?;
+                let code = last_error(env, class)?;
+                if array.is_null() {
+                    return Ok((None, code));
+                }
+                Ok((Some(env.convert_byte_array(JByteArray::from(array))?), code))
+            })?;
+            let spki = spki.ok_or_else(|| refusal(code))?;
+            sec1_point(&spki).ok_or(KeyError::Os(-13))
+        }
+
+        pub(super) fn sign(&self, message: &[u8], reason: &str) -> Result<Vec<u8>, KeyError> {
+            let (signature, code) = with_class(|env, class| {
+                let alias = env.new_string(TAG)?;
+                let bytes = env.byte_array_from_slice(message)?;
+                let title = env.new_string(reason)?;
+                let array = env
+                    .call_static_method(
+                        class,
+                        "sign",
+                        "(Ljava/lang/String;[BLjava/lang/String;)[B",
+                        &[
+                            JValue::Object(&alias),
+                            JValue::Object(&bytes),
+                            JValue::Object(&title),
+                        ],
+                    )?
+                    .l()?;
+                let code = last_error(env, class)?;
+                if array.is_null() {
+                    return Ok((None, code));
+                }
+                Ok((Some(env.convert_byte_array(JByteArray::from(array))?), code))
+            })?;
+            signature.ok_or_else(|| refusal(code))
+        }
+    }
+
+    /// The uncompressed point at the end of a P-256 SubjectPublicKeyInfo:
+    /// a BIT STRING whose 65 content bytes start with 0x04.
+    pub(super) fn sec1_point(spki: &[u8]) -> Option<Vec<u8>> {
+        let point = spki.get(spki.len().checked_sub(65)?..)?;
+        (point[0] == 0x04 && spki.len() == 91).then(|| point.to_vec())
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 mod imp {
     use super::KeyError;
 
-    #[cfg(target_os = "android")]
-    const WHY: &str = "Android Keystore and BiometricPrompt need the app shell";
-    #[cfg(not(target_os = "android"))]
     const WHY: &str = "not a phone";
 
     pub(super) enum Protection {
         Device,
+    }
+
+    impl Protection {
+        pub(super) const STORED: Protection = Protection::Device;
     }
 
     pub(super) struct Key;
@@ -702,7 +987,7 @@ mod tests {
         assert!(DeviceKey::load().unwrap().is_none());
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     #[test]
     fn other_platforms_say_unsupported() {
         assert!(matches!(DeviceKey::create(), Err(KeyError::Unsupported(_))));
