@@ -138,3 +138,18 @@ fn block_on<F: Future>(future: F) -> F::Output {
         std::thread::park();
     }
 }
+
+#[test]
+fn only_a_well_formed_device_id_is_kept() {
+    assert!(valid_device_id("pendant-0123456789abcdef"));
+    for bad in [
+        "",
+        "pendant-",
+        "pendant-0123",
+        "pendant-0123456789abcdeg",
+        "other-0123456789abcdef",
+        "pendant-0123456789abcdef0",
+    ] {
+        assert!(!valid_device_id(bad), "{bad}");
+    }
+}

@@ -25,7 +25,6 @@ use std::task::{Context, Poll, Waker};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use nsh_core::prelude::*;
-use nsh_core::storage::Storage;
 use serde::Serialize;
 
 use super::{Bridge, NetError};
@@ -38,9 +37,11 @@ pub const PAYLOAD_PREFIX: &str = "pendant-pair:v1:";
 /// app stops a little early so a write does not race the expiry.
 pub const GRANT_WINDOW: std::time::Duration = std::time::Duration::from_secs(25);
 
-/// Where the paired device id is kept between launches (not a secret: the
-/// key itself stays in the Keychain or Keystore).
-const PAIRED_KEY: &str = "pendant.paired-device";
+/// The file, in the app's data directory, that keeps the paired device id
+/// between launches. Not a secret: the key stays in the Keychain or
+/// Keystore. (nsh's `Storage` is not used: the iOS runner of nsh 0.5.0
+/// keeps it in memory only, so a relaunch forgot the pairing.)
+const PAIRED_FILE: &str = "paired-device";
 
 /// A parsed pairing payload. `Debug` never prints the nonce.
 #[derive(Clone, PartialEq, Eq)]
@@ -453,17 +454,71 @@ pub async fn worktree_create(
 
 // The pairing kept between launches.
 
+/// The paired device id kept from an earlier launch, if any.
 pub(crate) fn stored_device() -> Option<String> {
-    Storage::get_item(PAIRED_KEY).filter(|id| id.starts_with("pendant-"))
+    let path = app_dir()?.join(PAIRED_FILE);
+    let id = std::fs::read_to_string(path).ok()?;
+    valid_device_id(id.trim()).then(|| id.trim().to_owned())
 }
 
+/// Keeps (`Some`) or forgets (`None`) the paired device id.
 pub(crate) fn store_device(device_id: Option<&str>) {
+    let Some(dir) = app_dir() else {
+        return;
+    };
+    let path = dir.join(PAIRED_FILE);
     match device_id {
         Some(id) => {
-            let _ = Storage::set_item(PAIRED_KEY, id);
+            // Written beside, then renamed: a crash leaves the old file or
+            // the new one, never half of one.
+            let partial = dir.join(format!("{PAIRED_FILE}.partial"));
+            let kept = std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(&partial, id))
+                .and_then(|()| std::fs::rename(&partial, &path));
+            if let Err(err) = kept {
+                super::live::trace(&format!("pairing not kept: {}", err.kind()));
+            }
         }
-        None => Storage::remove_item(PAIRED_KEY),
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
     }
+}
+
+fn valid_device_id(id: &str) -> bool {
+    id.strip_prefix("pendant-")
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The app's own data directory: nsh's when the host gives one, else the
+/// platform's per-app place.
+fn app_dir() -> Option<std::path::PathBuf> {
+    data_dir().or_else(platform_dir)
+}
+
+#[cfg(target_os = "ios")]
+fn platform_dir() -> Option<std::path::PathBuf> {
+    // An iOS app's HOME is its own data container.
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::Path::new(&home).join("Library/Application Support/Pendant"))
+}
+
+#[cfg(target_os = "android")]
+fn platform_dir() -> Option<std::path::PathBuf> {
+    // The process name is the package; its private files directory.
+    let cmdline = std::fs::read("/proc/self/cmdline").ok()?;
+    let package = cmdline.split(|b| *b == 0).next()?;
+    let package = std::str::from_utf8(package).ok()?;
+    let valid = !package.is_empty()
+        && package
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_');
+    valid.then(|| std::path::PathBuf::from(format!("/data/data/{package}/files")))
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn platform_dir() -> Option<std::path::PathBuf> {
+    None
 }
 
 #[cfg(test)]
