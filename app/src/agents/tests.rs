@@ -60,3 +60,11 @@ fn write_errors_carry_their_own_copy_and_severity() {
     let (_, color) = note_for(&WriteError::Key(KeyError::AuthFailed));
     assert_eq!(color, crate::theme::GOLD);
 }
+
+#[test]
+fn the_worktree_stamp_is_six_digits() {
+    use super::detail::wt_stamp;
+    let stamp = wt_stamp();
+    assert_eq!(stamp.len(), 6);
+    assert!(stamp.bytes().all(|b| b.is_ascii_digit()), "{stamp}");
+}

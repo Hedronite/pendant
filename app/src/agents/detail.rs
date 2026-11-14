@@ -21,6 +21,30 @@ use crate::net::NetError;
 use crate::theme;
 use crate::Nav;
 
+/// Which platform this build runs on, for made-up worktree names.
+const WT_PLATFORM: &str = if cfg!(target_os = "android") {
+    "android"
+} else if cfg!(target_os = "ios") {
+    "ios"
+} else {
+    "host"
+};
+
+/// The UTC `HHMMSS` stamp a default worktree branch carries, so two
+/// creates a minute apart do not collide.
+pub(crate) fn wt_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!(
+        "{:02}{:02}{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
 /// One agent, pushed with `Route::Agent(id)`. The id the bridge resolves
 /// (`w1:p2`, a name) is the page's title and the route's key.
 pub fn detail(nav: Nav, id: String) -> Screen {
@@ -79,6 +103,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     let busy = signal(false);
     let write_error = signal(None::<WriteError>);
     let draft = signal(String::new());
+    let wt_branch = signal(format!("pendant-wt-{WT_PLATFORM}-{}", wt_stamp()));
     let made = signal(None::<String>);
     let paired = move || matches!(live.pairing.get(), PairState::Paired { .. });
     let enabled = move || !busy.get() && paired();
@@ -268,6 +293,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                             .child(write_section(
                                 live,
                                 draft,
+                                wt_branch,
                                 made,
                                 write_error,
                                 enabled,
@@ -545,6 +571,7 @@ fn blocked(live: Live, id: &str) -> bool {
 fn write_section(
     live: Live,
     draft: Signal<String>,
+    wt_branch: Signal<String>,
     made: Signal<Option<String>>,
     error: Signal<Option<WriteError>>,
     enabled: impl Fn() -> bool + Copy + 'static,
@@ -613,6 +640,19 @@ fn write_section(
                     on_worktree,
                     ButtonKind::Quiet,
                 ))),
+        )
+        .child(
+            // Always one element, like the prompt field above: the branch
+            // the create takes, prefilled with a unique default.
+            input()
+                .test_id("worktree-branch")
+                .value(move || wt_branch.get())
+                .placeholder("pendant-wt-…")
+                .auto_capitalize(AutoCapitalize::None)
+                .auto_correct(false)
+                .on_change(move |text: &str| wt_branch.set(text.to_owned()))
+                .text_size(px(13.0))
+                .text_color(rgb(theme::TEXT)),
         )
         .child(
             // Always one row: a when() around this button would re-create
