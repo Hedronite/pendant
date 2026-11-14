@@ -2,7 +2,7 @@
 name = "pendant-app"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/Hedronite/pendant"
 description = "Pendant's phone app"
@@ -13,10 +13,11 @@ publish = false
 path = "src/notes/store.rs"
 
 [dependencies]
-# Pinned to the Lapis engine merge that carries GOAL-mobile G0-G3. lapis-notes
-# is publish = false, so both stay git deps at this exact rev, never a version.
-lapis-lattice = { git = "https://github.com/Hedronite/lapis-lattice", rev = "da4d1ce815d55f89db5cbf8ec2879e14f8957add" }
-lapis-notes = { git = "https://github.com/Hedronite/lapis-lattice", rev = "da4d1ce815d55f89db5cbf8ec2879e14f8957add" }
+# Pinned to the Lapis v0.5.0 release merge (rusqlite 0.42, libsqlite3-sys 0.40;
+# clears RUSTSEC-2026-0459). It still carries GOAL-mobile G0-G3. lapis-notes is
+# publish = false, so both stay git deps at this exact rev, never a version.
+lapis-lattice = { git = "https://github.com/Hedronite/lapis-lattice", rev = "42aa3b8dcdac51c684bd3cd4c3c6a5c3c17a9092" }
+lapis-notes = { git = "https://github.com/Hedronite/lapis-lattice", rev = "42aa3b8dcdac51c684bd3cd4c3c6a5c3c17a9092" }
 
 # NSURLIsExcludedFromBackupKey on the index directory (iOS, and macOS dev hosts).
 [target.'cfg(target_vendor = "apple")'.dependencies]
@@ -24,7 +25,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 # Same major as lapis-lattice's, so it unifies: the tests read the index file.
-rusqlite = "0.40"
+rusqlite = "0.42"
 
 # Its own workspace, apart from the bridge crates at the repo root.
 [workspace]
