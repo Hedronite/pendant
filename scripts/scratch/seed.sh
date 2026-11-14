@@ -68,20 +68,40 @@ fourth="$(split "$second" down)"
 panes=("$root" "$second" "$third" "$fourth")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PANE_RUNNER="$SCRIPT_DIR/pane.sh"
+AGENT_SCRIPT="$SCRIPT_DIR/agent.sh"
+# herdr detects an agent by the foreground process name, so the pane runs the
+# fixture through a symlink deliberately named after a supported agent. The
+# directory is fresh per seed, holds only that symlink, is prepended to the
+# pane PATH only, and teardown removes it.
+BIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pendant-scratch-bin.XXXXXX")"
+ln -s "$AGENT_SCRIPT" "$BIN_DIR/claude"
+BIN_STATE="$HOME/.config/herdr/sessions/$SESSION/scratch-bin.path"
+printf '%s\n' "$BIN_DIR" >"$BIN_STATE"
 
 for index in "${!panes[@]}"; do
     pane="${panes[$index]}"
     number=$((index + 1))
     state=idle
     [ "$number" -eq "$BLOCKED_INDEX" ] && state=blocked
-    # The runner erases this typed line and the prompt before printing anything,
-    # so the pane holds fixture text only. env -i plus --noprofile --norc keeps
-    # the operator's shell out of it.
-    command="$(printf 'exec env -i HOME=%q PATH=%q HERDR_BIN=%q TICK_PANE=%q REFRESH_SECONDS=%q bash --noprofile --norc %q %q %q %q %q' \
-        "$HOME" "$PATH" "$HERDR" "$TICKER_INDEX" "$REFRESH_SECONDS" \
-        "$PANE_RUNNER" "$number" "$state" "$SESSION" "$pane")"
+    # The agent erases this typed line and the prompt before printing anything,
+    # so the pane holds fixture text only. env -i with the scratch bin first and
+    # system directories only; no inherited PATH, no operator shell.
+    command="$(printf 'exec env -i HOME=%q PATH=%q HERDR_BIN=%q PENDANT_AGENT_NAME=%q TICK_PANE=%q REFRESH_SECONDS=%q claude %q %q %q %q' \
+        "$HOME" "$BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin" "$HERDR" \
+        "scratch-$number" "$TICKER_INDEX" "$REFRESH_SECONDS" \
+        "$number" "$state" "$SESSION" "$pane")"
     h pane run "$pane" "$command" >/dev/null
+done
+
+# Detection is asynchronous. Wait for four agents, then give each a scratch
+# display name so the fixture reads as fixture.
+for _ in $(seq 1 100); do
+    detected="$(h api snapshot | jq '.result.snapshot.agents | length')"
+    [ "$detected" = "4" ] && break
+    sleep 0.1
+done
+for index in "${!panes[@]}"; do
+    h agent rename "${panes[$index]}" "scratch-$((index + 1))" >/dev/null 2>&1 || true
 done
 
 for _ in $(seq 1 100); do
