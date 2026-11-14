@@ -587,6 +587,7 @@ fn write_section(
         .gap_3()
         .p_4()
         .pt_3()
+        .pb_safe_area_plus(px(16.0))
         .child(
             text(move || {
                 if live.grant_open() {
@@ -689,6 +690,7 @@ fn decision_bar(
         .gap_3()
         .p_4()
         .pt_3()
+        .pb_safe_area_plus(px(16.0))
         .border_t_1()
         .border_color(rgb(theme::LINE))
         .bg(rgb(theme::SURFACE))

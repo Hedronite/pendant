@@ -142,6 +142,7 @@ pub fn list(nav: Nav) -> Screen {
                                 }))
                         },
                     )
+                    .content_padding_bottom(safe_area().bottom)
                     .estimated_item_size(px(56.0))
                     .keys(move || {
                         live.snapshot.with(|snap| {

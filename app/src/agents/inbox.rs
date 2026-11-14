@@ -67,6 +67,7 @@ pub fn inbox(nav: Nav) -> Screen {
                                 }))
                         },
                     )
+                    .content_padding_bottom(safe_area().bottom)
                     .estimated_item_size(px(64.0))
                     .keys(move || {
                         live.inbox.with(|items| {
