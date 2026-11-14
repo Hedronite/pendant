@@ -7,7 +7,6 @@ use std::rc::Rc;
 
 use nsh_base::alert_dialog;
 use nsh_base::nav_page;
-use nsh_core::element::create_root;
 use nsh_core::element::input;
 use nsh_core::prelude::*;
 
@@ -21,6 +20,40 @@ use crate::net::types::AgentDetail;
 use crate::net::NetError;
 use crate::theme;
 use crate::Nav;
+
+/// The request a worktree create sends: the agent's workspace and the
+/// branch the field carries.
+pub(crate) fn worktree_request(workspace_id: Option<String>, branch: String) -> WorktreeRequest {
+    WorktreeRequest {
+        workspace_id,
+        branch: Some(branch),
+        ..Default::default()
+    }
+}
+
+/// Which platform this build runs on, for made-up worktree names.
+const WT_PLATFORM: &str = if cfg!(target_os = "android") {
+    "android"
+} else if cfg!(target_os = "ios") {
+    "ios"
+} else {
+    "host"
+};
+
+/// The UTC `HHMMSS` stamp a default worktree branch carries, so two
+/// creates a minute apart do not collide.
+pub(crate) fn wt_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!(
+        "{:02}{:02}{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
 
 /// One agent, pushed with `Route::Agent(id)`. The id the bridge resolves
 /// (`w1:p2`, a name) is the page's title and the route's key.
@@ -80,12 +113,15 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     let busy = signal(false);
     let write_error = signal(None::<WriteError>);
     let draft = signal(String::new());
+    let wt_branch = signal(format!("pendant-wt-{WT_PLATFORM}-{}", wt_stamp()));
     let made = signal(None::<String>);
     let paired = move || matches!(live.pairing.get(), PairState::Paired { .. });
     let enabled = move || !busy.get() && paired();
     let prompt_id = id.clone();
     let send_prompt = move |text: String| {
+        eprintln!("pendant: send_prompt fired");
         if text.is_empty() {
+            eprintln!("pendant: send_prompt empty text, dropped");
             return;
         }
         let live = live;
@@ -114,6 +150,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     let on_submit = move |text: &str| submit_send(text.trim().to_owned());
     let approve_id = id.clone();
     let on_approve = move || {
+        eprintln!("pendant: approve fired");
         let live = live;
         let id = approve_id.clone();
         busy.set(true);
@@ -131,6 +168,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     };
     let deny_id = id.clone();
     let on_deny = move || {
+        eprintln!("pendant: deny fired, asking to confirm");
         let answer = alert_dialog()
             .title("Deny the agent?")
             .description("The agent's waiting request is refused.")
@@ -140,10 +178,13 @@ pub fn detail(nav: Nav, id: String) -> Screen {
         let live = live;
         let id = deny_id.clone();
         spawn(async move {
-            if answer
+            let chosen = answer
                 .await
-                .is_ok_and(|r| r.action.as_deref() == Some("deny"))
-            {
+                .ok()
+                .and_then(|r| r.action)
+                .unwrap_or_else(|| "<dismissed>".into());
+            eprintln!("pendant: deny dialog answered {chosen}");
+            if chosen == "deny" {
                 busy.set(true);
                 error_set(&write_error, None);
                 detached_write(
@@ -160,6 +201,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
         });
     };
     let on_open_grant = move || {
+        eprintln!("pendant: open_grant fired");
         let live = live;
         busy.set(true);
         error_set(&write_error, None);
@@ -176,8 +218,19 @@ pub fn detail(nav: Nav, id: String) -> Screen {
     };
     let worktree_id = id.clone();
     let on_worktree = move || {
+        eprintln!("pendant: worktree fired");
         let live = live;
         let id = worktree_id.clone();
+        let branch = wt_branch.get_untracked().trim().to_owned();
+        if branch.is_empty() {
+            error_set(
+                &write_error,
+                Some(WriteError::Net(NetError::Transport(
+                    "the branch name is empty".to_owned(),
+                ))),
+            );
+            return;
+        }
         busy.set(true);
         error_set(&write_error, None);
         detached_write(
@@ -186,11 +239,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                 let request = live.snapshot.with_untracked(|snap| {
                     snap.as_ref()
                         .and_then(|snap| snap.agent(&id))
-                        .map(|agent| WorktreeRequest {
-                            workspace_id: Some(agent.workspace_id.clone()),
-                            branch: Some("pendant-g2-wt-sim".to_owned()),
-                            ..Default::default()
-                        })
+                        .map(|agent| worktree_request(Some(agent.workspace_id.clone()), branch))
                 });
                 let Some(request) = request else {
                     return Err(WriteError::Net(NetError::Transport(
@@ -260,6 +309,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                             .child(write_section(
                                 live,
                                 draft,
+                                wt_branch,
                                 made,
                                 write_error,
                                 enabled,
@@ -492,34 +542,23 @@ async fn with_grant<T, F: Future<Output = Result<T, WriteError>>>(
     run().await
 }
 
-/// A detached task kept alive: its root owner and its handle, released
-/// by the task itself when it ends.
-type DetachedTask = Option<(Owner, Spawned<()>)>;
-
 /// Runs a write outside the page's owner: leaving the page does not
 /// cancel it (a pairing task died exactly that way). The `settle` step
 /// touches the page's state only while the page still lives.
-fn detached_write<T>(
+fn detached_write<T: 'static>(
     page: Owner,
     future: impl Future<Output = T> + 'static,
     settle: impl FnOnce(T) + 'static,
 ) {
-    // Dropping the spawned handle cancels the task before its first
-    // poll, and the root owner would go with it, so both live in a slot
-    // the task empties as its last step: the root and the handle are
-    // released only when the write is done.
-    let slot: Rc<RefCell<DetachedTask>> = Rc::new(RefCell::new(None));
-    let keep = Rc::clone(&slot);
-    let (owner, task) = create_root(move || {
-        spawn(async move {
-            let out = future.await;
-            if page.is_live() {
-                settle(out);
-            }
-            keep.borrow_mut().take();
-        })
+    // Runs under the app root and keeps its task handle until it ends
+    // (dropping an nsh task handle cancels the task); settles only while
+    // the page is still there.
+    crate::net::live::spawn_detached(async move {
+        let out = future.await;
+        if page.is_live() {
+            settle(out);
+        }
     });
-    *slot.borrow_mut() = Some((owner, task));
 }
 
 /// Sets the write error from a task.
@@ -548,6 +587,7 @@ fn blocked(live: Live, id: &str) -> bool {
 fn write_section(
     live: Live,
     draft: Signal<String>,
+    wt_branch: Signal<String>,
     made: Signal<Option<String>>,
     error: Signal<Option<WriteError>>,
     enabled: impl Fn() -> bool + Copy + 'static,
@@ -563,6 +603,7 @@ fn write_section(
         .gap_3()
         .p_4()
         .pt_3()
+        .pb_safe_area_plus(px(16.0))
         .child(
             text(move || {
                 if live.grant_open() {
@@ -572,19 +613,26 @@ fn write_section(
                 }
             })
             .test_id("grant-line")
+            .label(move || {
+                if live.grant_open() {
+                    "grant open".to_owned()
+                } else {
+                    "grant closed".to_owned()
+                }
+            })
             .text_size(px(12.0))
             .text_color(rgb(theme::DIM)),
         )
-        .child(when(
-            move || made.get().is_some(),
-            move || {
-                text(move || made.get().unwrap_or_default())
-                    .test_id("made-note")
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(theme::TEAL))
-            },
-        ))
+        // Always one element: a when() here would re-create the input
+        // below when the note appears or goes, and the re-created field
+        // loses its on_change binding.
+        .child(
+            text(move || made.get().unwrap_or_default())
+                .test_id("made-note")
+                .text_size(px(13.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::TEAL)),
+        )
         .child(
             input()
                 .test_id("prompt-input")
@@ -617,18 +665,32 @@ fn write_section(
                     ButtonKind::Quiet,
                 ))),
         )
-        .child(when(
-            move || enabled() && !live.grant_open(),
-            move || {
-                view().child(write_button(
-                    "open-grant",
-                    "Open grant",
-                    enabled,
-                    on_open_grant,
-                    ButtonKind::Quiet,
-                ))
-            },
-        ))
+        .child(
+            // Always one element, like the prompt field above: the branch
+            // the create takes, prefilled with a unique default.
+            input()
+                .test_id("worktree-branch")
+                .value(move || wt_branch.get())
+                .placeholder("pendant-wt-…")
+                .auto_capitalize(AutoCapitalize::None)
+                .auto_correct(false)
+                .on_change(move |text: &str| wt_branch.set(text.to_owned()))
+                .text_size(px(13.0))
+                .text_color(rgb(theme::TEXT)),
+        )
+        .child(
+            // Always one row: a when() around this button would re-create
+            // the input above when the grant state flips, and the
+            // re-created field loses its on_change binding. The button
+            // stays and simply reads as unavailable while a grant is open.
+            view().child(write_button(
+                "open-grant",
+                "Open grant",
+                move || enabled() && !live.grant_open(),
+                on_open_grant,
+                ButtonKind::Quiet,
+            )),
+        )
         .child(write_note(move || error.get()))
 }
 
@@ -641,10 +703,17 @@ fn decision_bar(
     let enabled_deny = enabled;
     view()
         .test_id("decision-bar")
+        .on_layout(|frame: &Bounds<Points>| {
+            eprintln!(
+                "pendant: decision-bar layout {}x{} at {},{}",
+                frame.size.width.0, frame.size.height.0, frame.origin.x.0, frame.origin.y.0
+            );
+        })
         .flex_row()
         .gap_3()
         .p_4()
         .pt_3()
+        .pb_safe_area_plus(px(16.0))
         .border_t_1()
         .border_color(rgb(theme::LINE))
         .bg(rgb(theme::SURFACE))

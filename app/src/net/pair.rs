@@ -283,12 +283,13 @@ impl<T> Future for OffThread<T> {
     }
 }
 
-async fn identity() -> Result<Identity, WriteError> {
+/// A new key for a new pairing. Any stored key is deleted first: after a
+/// host revoke the bridge refuses that key's device id for good, so a
+/// pairing never reuses an old key, and a revoked key never comes back.
+async fn fresh_identity() -> Result<Identity, WriteError> {
     off_thread(|| {
-        let key = match DeviceKey::load()? {
-            Some(key) => key,
-            None => DeviceKey::create()?,
-        };
+        DeviceKey::delete()?;
+        let key = DeviceKey::create()?;
         Ok::<_, KeyError>(Identity {
             device_id: device_id(key.public_key()),
             public_b64: STANDARD.encode(key.public_key()),
@@ -344,7 +345,7 @@ impl Bridge {
 /// Pairs this device from the payload. Biometric: once, for the pair
 /// signature.
 pub async fn pair(bridge: &Bridge, payload: &Payload) -> Result<String, WriteError> {
-    let me = identity().await?;
+    let me = fresh_identity().await?;
     let message = pair_message(&me.device_id, &me.public_b64, &payload.nonce);
     let sig = sign(message, "Pair this device with Pendant").await?;
     let body = serde_json::json!({
