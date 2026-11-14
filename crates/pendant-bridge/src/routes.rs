@@ -423,7 +423,25 @@ struct PairBody {
     takeover: bool,
 }
 
-async fn pair_device(State(state): State<AppState>, Json(body): Json<PairBody>) -> Response {
+/// Presence-only record of a pair request. booleans and fixed strings only:
+/// no header value, no address, no nonce, no device id, no key.
+fn log_pair_request(state: &AppState, headers: &HeaderMap) {
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    tracing::info!(
+        method = "POST",
+        path = "/v1/pair",
+        via_serve = via_serve(host, state.serve_origin.as_deref()),
+        forwarded = proxy_forwarded(headers),
+        "pair request"
+    );
+}
+
+async fn pair_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PairBody>,
+) -> Response {
+    log_pair_request(&state, &headers);
     match state.pairing.pair(
         &body.device_id,
         &body.public_key,
@@ -1672,5 +1690,56 @@ mod tests {
         .await;
         assert_eq!(status, 429);
         assert!(raw.contains("rate_limited"));
+    }
+
+    #[test]
+    fn pair_request_log_carries_no_header_value() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let log_path = dir.path().join("pair-request.log");
+        let writer = {
+            let path = log_path.clone();
+            move || {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+            }
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(writer)
+            .finish();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "serve.invalid".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        headers.insert("x-pendant-device", "device-secret".parse().unwrap());
+        headers.insert("x-pendant-challenge", "challenge-secret".parse().unwrap());
+        headers.insert("x-pendant-signature", "signature-secret".parse().unwrap());
+        let state = AppState {
+            herdr: HerdrClient::new("/tmp/unused.sock"),
+            queue_cap: 8,
+            bind: "127.0.0.1:8780".parse().unwrap(),
+            serve_origin: Some("https://serve.invalid".into()),
+            pairing: pairing::Pairing::new(),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_pair_request(&state, &headers);
+        });
+
+        let line = std::fs::read_to_string(&log_path).unwrap();
+        assert!(line.contains("pair request"), "{line}");
+        assert!(line.contains("via_serve=true"), "{line}");
+        assert!(line.contains("forwarded=true"), "{line}");
+        for secret in [
+            "203.0.113.5",
+            "serve.invalid",
+            "device-secret",
+            "challenge-secret",
+            "signature-secret",
+        ] {
+            assert!(!line.contains(secret), "{secret} leaked: {line}");
+        }
     }
 }
