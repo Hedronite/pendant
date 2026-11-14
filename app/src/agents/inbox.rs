@@ -3,21 +3,16 @@
 use nsh_base::nav_page;
 use nsh_core::prelude::*;
 
-use crate::agents::{error_note, event_label, page_header, status_pill};
+use crate::agents::{error_line, event_label, page_header, status_pill};
+use crate::net::live::live;
 use crate::theme;
 use crate::{Nav, Route};
 
-/// The inbox, pushed with `Route::Inbox`. Today it reads `GET /v1/events`
-/// once on mount, with pull to refresh; live WebSocket updates wait on a PM
-/// ruling (SPEC-shell G1).
+/// The inbox, pushed with `Route::Inbox`. The live link refreshes the
+/// events every few seconds; WebSocket-driven updates wait on a PM ruling
+/// (SPEC-shell G1).
 pub fn inbox(nav: Nav) -> Screen {
-    let inbox = resource(
-        move || Some(()),
-        move |(), _| async move {
-            let bridge = crate::bridge().map_err(|err| err.to_string())?;
-            bridge.inbox().await.map_err(|err| err.to_string())
-        },
-    );
+    let live = live();
 
     nav_page()
         .title("Inbox")
@@ -25,27 +20,17 @@ pub fn inbox(nav: Nav) -> Screen {
         .child(
             view()
                 .flex_1()
+                .flex_col()
                 .bg(rgb(theme::GRAPHITE))
                 .child(
                     when(
-                        move || inbox.error().is_some(),
-                        move || {
-                            error_note(
-                                move || {
-                                    inbox
-                                        .error()
-                                        .map(|err| err.to_owned())
-                                        .unwrap_or_default()
-                                        .into()
-                                },
-                                move || inbox.refetch(),
-                            )
-                        },
+                        move || live.error.get().is_some(),
+                        move || error_line(move || live.error.get().unwrap_or_default().into()),
                     ),
                 )
                 .child(
                     virtual_list(
-                        move || inbox.get().map_or(0, |events| events.items.len()),
+                        move || live.inbox.with(Vec::len),
                         move |at| {
                             view()
                                 .min_h(px(56.0))
@@ -55,22 +40,20 @@ pub fn inbox(nav: Nav) -> Screen {
                                 .px_4()
                                 .py_2()
                                 .on_press(move || {
-                                    let id = inbox
-                                        .get()
-                                        .and_then(|events| events.items.get(at.index()).cloned())
-                                        .map(|item| item.id.clone());
+                                    let id = live
+                                        .inbox
+                                        .with(|items| items.get(at.index()).map(|item| item.id.clone()));
                                     if let Some(id) = id {
                                         nav.push(Route::Agent(id));
                                     }
                                 })
                                 .child(
-                                    // The agent the event is about: its
-                                    // title, else its name, else its id.
+                                    // The agent the event is about.
                                     text(move || {
-                                        inbox
-                                            .get()
-                                            .and_then(|events| events.items.get(at.index()).cloned())
-                                            .map(|item| event_label(&item))
+                                        live.inbox
+                                            .with(|items| {
+                                                items.get(at.index()).map(event_label)
+                                            })
                                             .unwrap_or_default()
                                     })
                                     .text_size(px(16.0))
@@ -79,37 +62,31 @@ pub fn inbox(nav: Nav) -> Screen {
                                     .flex_1(),
                                 )
                                 .child(status_pill(move || {
-                                    inbox
-                                        .get()
-                                        .and_then(|events| events.items.get(at.index()).cloned())
-                                        .map(|item| item.kind.clone())
+                                    live.inbox
+                                        .with(|items| {
+                                            items.get(at.index()).map(|item| item.kind.clone())
+                                        })
                                         .unwrap_or_default()
-                                })),
+                                        .into()
+                                }))
                         },
                     )
                     .estimated_item_size(px(64.0))
                     .keys(move || {
-                        inbox
-                            .get()
-                            .map(|events| {
-                                events
-                                    .items
-                                    .iter()
-                                    .map(|item| item.id.clone())
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
+                        live.inbox
+                            .with(|items| items.iter().map(|item| item.id.clone()).collect::<Vec<_>>())
                     })
                     .separator(move || view().h(px(1.0)).mx_4().bg(rgb(theme::LINE)))
-                    .on_refresh(move || inbox.refetch())
-                    .refreshing(move || inbox.loading())
-                    .empty(|| {
+                    .empty(
                         view().p_8().items_center().child(
-                            text("Nothing needs you")
-                                .text_size(px(15.0))
-                                .text_color(rgb(theme::DIM)),
-                        )
-                    })
+                            text(move || match live.link.get() {
+                                crate::net::live::Link::Connecting => "Connecting…".to_owned(),
+                                _ => "Nothing needs you".to_owned(),
+                            })
+                            .text_size(px(15.0))
+                            .text_color(rgb(theme::DIM)),
+                        ),
+                    )
                     .flex_1(),
                 ),
         )

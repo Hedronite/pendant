@@ -5,9 +5,9 @@
 //!   agent and `nav.push(Route::Inbox)` the inbox.
 //! - `detail(nav, id)` and `inbox(nav)` are pushed pages.
 //!
-//! Data comes from [`crate::bridge`] and [`crate::net`]; the screens hold no
-//! client of their own. WebSocket inbox updates wait on a PM ruling; the
-//! inbox reads `Bridge::inbox()`.
+//! Data comes from the live link ([`crate::net::live`], the shared
+//! snapshot/inbox/pane signals fullstack refreshes) and, for an agent's
+//! recent output, [`crate::bridge`]. No screen holds a client of its own.
 
 mod detail;
 mod inbox;
@@ -23,6 +23,7 @@ mod tests;
 use nsh_core::prelude::*;
 
 use crate::theme;
+use crate::Nav;
 
 /// What an inbox row shows for an event: the item's title, else the agent's
 /// name, else its id.
@@ -38,7 +39,10 @@ pub(crate) fn event_label(item: &crate::net::InboxItem) -> String {
 /// Graphite — the treatment a row, a detail page and an inbox item share.
 /// The status reads through `status` every turn, so a recycled row or a
 /// refetch updates the pill in place.
-pub(crate) fn status_pill(status: impl Fn() -> SharedString + Copy + 'static) -> impl IntoElement {
+pub(crate) fn status_pill(status: impl Fn() -> SharedString + Clone + 'static) -> impl IntoElement {
+    let status_bg = status.clone();
+    let status_text = status.clone();
+    let status_fg = status.clone();
     view()
         .flex_row()
         .items_center()
@@ -46,18 +50,28 @@ pub(crate) fn status_pill(status: impl Fn() -> SharedString + Copy + 'static) ->
         .px(px(10.0))
         .py(px(3.0))
         .bg(move || {
-            let (bg, _) = theme::status_pill(&status());
+            let (bg, _) = theme::status_pill(&status_bg());
             rgb(bg)
         })
         .child(
-            text(status)
+            text(move || status_text().to_string())
                 .text_size(px(12.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(move || {
-                    let (_, fg) = theme::status_pill(&status());
+                    let (_, fg) = theme::status_pill(&status_fg());
                     rgb(fg)
                 }),
         )
+}
+
+/// What a failed shared fetch shows. The live link retries itself every
+/// [`crate::net::live::POLL`], so this is the error text only.
+pub(crate) fn error_line(error: impl Fn() -> SharedString + Copy + 'static) -> impl IntoElement {
+    view().p_4().child(
+        text(error)
+            .text_size(px(13.0))
+            .text_color(rgb(theme::DIM)),
+    )
 }
 
 /// What a failed load shows: the error, and Retry, which refetches.
@@ -82,6 +96,44 @@ pub(crate) fn error_note(
                 .text_color(rgb(theme::TEAL))
                 .on_press(retry)
                 .role(AccessibilityRole::Button),
+        )
+}
+
+/// The link state one line, for the bottom of a page's header slot and the
+/// top of a page's content: what the WebSocket is doing right now.
+pub(crate) fn link_line(link: impl Fn() -> crate::net::live::Link + Copy + 'static) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_4()
+        .py_2()
+        .border_b_1()
+        .border_color(rgb(theme::LINE))
+        .child(
+            view()
+                .size(px(8.0))
+                .rounded(px(4.0))
+                .bg(move || match link() {
+                    crate::net::live::Link::Open => rgb(theme::TEAL),
+                    crate::net::live::Link::Connecting => rgb(theme::DIM),
+                    _ => rgb(theme::GOLD),
+                }),
+        )
+        .child(
+            text(move || match link() {
+                crate::net::live::Link::Open => "Live".to_owned(),
+                crate::net::live::Link::Connecting => "Connecting…".to_owned(),
+                crate::net::live::Link::Closed(why) => format!("Reconnecting: {why}"),
+                crate::net::live::Link::Unconfigured(why) => format!("No bridge address: {why}"),
+            })
+            .text_size(px(12.0))
+            .text_color(move || match link() {
+                crate::net::live::Link::Open => rgb(theme::TEXT),
+                crate::net::live::Link::Connecting => rgb(theme::DIM),
+                _ => rgb(theme::GOLD),
+            })
+            .number_of_lines(1),
         )
 }
 
