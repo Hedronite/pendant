@@ -94,7 +94,10 @@ pub fn detail(nav: Nav, id: String) -> Screen {
             let result = with_grant(live, || live.prompt(&id, &text)).await;
             busy.set(false);
             match result {
-                Ok(()) => draft.set(String::new()),
+                Ok(()) => {
+                    draft.set(String::new());
+                    made.set(Some("Prompt sent.".to_owned()));
+                }
                 Err(err) => error_set(&write_error, Some(err)),
             }
         });
@@ -137,6 +140,19 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                 if let Err(err) = result {
                     error_set(&write_error, Some(err));
                 }
+            }
+        });
+    };
+
+    let on_open_grant = move || {
+        let live = live;
+        spawn(async move {
+            busy.set(true);
+            error_set(&write_error, None);
+            let result = live.open_grant().await;
+            busy.set(false);
+            if let Err(err) = result {
+                error_set(&write_error, Some(err));
             }
         });
     };
@@ -224,8 +240,9 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                                 draft,
                                 made,
                                 write_error,
-                                enabled,
+                                enabled.clone(),
                                 on_prompt,
+                                on_open_grant.clone(),
                                 on_worktree,
                             ))
                             .child(when(
@@ -483,10 +500,13 @@ fn write_section(
     error: Signal<Option<WriteError>>,
     enabled: impl Fn() -> bool + Clone + 'static,
     on_prompt: impl Fn() + Clone + 'static,
+    on_open_grant: impl Fn() + Clone + 'static,
     on_worktree: impl Fn() + Clone + 'static,
 ) -> impl IntoElement {
     let enabled_send = enabled.clone();
-    let enabled_wt = enabled;
+    let enabled_wt = enabled.clone();
+    let enabled_cond = enabled.clone();
+    let enabled_grant = enabled.clone();
     view()
         .flex_col()
         .gap_3()
@@ -500,6 +520,7 @@ fn write_section(
                     "grant closed — the next write opens one".to_owned()
                 }
             })
+            .test_id("grant-line")
             .text_size(px(12.0))
             .text_color(rgb(theme::DIM)),
         )
@@ -507,6 +528,7 @@ fn write_section(
             move || made.get().is_some(),
             move || {
                 text(move || made.get().unwrap_or_default())
+                    .test_id("made-note")
                     .text_size(px(13.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(theme::TEAL))
@@ -514,6 +536,7 @@ fn write_section(
         ))
         .child(
             input()
+                .test_id("prompt-input")
                 .value(move || draft.get())
                 .placeholder("Prompt the agent…")
                 .multiline(true)
@@ -526,18 +549,34 @@ fn write_section(
                 .flex_row()
                 .gap_3()
                 .child(view().flex_1().child(write_button(
+                    "send-prompt",
                     "Send prompt",
                     move || enabled_send() && !draft.get().trim().is_empty(),
                     on_prompt,
                     ButtonKind::Primary,
                 )))
                 .child(view().flex_1().child(write_button(
+                    "new-worktree",
                     "New worktree",
                     enabled_wt,
                     on_worktree,
                     ButtonKind::Quiet,
                 ))),
         )
+        .child(when(
+            move || enabled_cond() && !live.grant_open(),
+            move || {
+                let on_open_grant = on_open_grant.clone();
+                let enabled = enabled_grant.clone();
+                view().child(write_button(
+                    "open-grant",
+                    "Open grant",
+                    enabled,
+                    on_open_grant,
+                    ButtonKind::Quiet,
+                ))
+            },
+        ))
         .child(write_note(move || error.get()))
 }
 
@@ -549,6 +588,7 @@ fn decision_bar(
 ) -> impl IntoElement {
     let enabled_deny = enabled.clone();
     view()
+        .test_id("decision-bar")
         .flex_row()
         .gap_3()
         .p_4()
@@ -557,12 +597,14 @@ fn decision_bar(
         .border_color(rgb(theme::LINE))
         .bg(rgb(theme::SURFACE))
         .child(view().flex_1().child(write_button(
+            "approve",
             "Approve",
             enabled,
             on_approve,
             ButtonKind::Primary,
         )))
         .child(view().flex_1().child(write_button(
+            "deny",
             "Deny",
             enabled_deny,
             on_deny,

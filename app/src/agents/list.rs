@@ -87,7 +87,16 @@ pub fn list(nav: Nav) -> Screen {
                                 .with(|snap| snap.as_ref().map_or(0, |snap| snap.agents.len()))
                         },
                         move |at| {
+                            let row_id = live
+                                .snapshot
+                                .with(|snap| {
+                                    snap.as_ref()
+                                        .and_then(|snap| snap.agents.get(at.index()).cloned())
+                                        .map(|agent| format!("agent-row-{}", agent.id))
+                                })
+                                .unwrap_or_default();
                             view()
+                                .test_id(row_id.as_str())
                                 .h(px(56.0))
                                 .flex_row()
                                 .items_center()

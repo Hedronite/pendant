@@ -128,7 +128,7 @@ pub(crate) fn note_for(error: &WriteError) -> (String, u32) {
 pub(crate) fn write_note(
     error: impl Fn() -> Option<WriteError> + Copy + 'static,
 ) -> impl IntoElement {
-    view().px_4().py_1().child(
+    view().test_id("write-error").px_4().py_1().child(
         text(move || error().map(|err| note_for(&err).0).unwrap_or_default())
             .text_size(px(12.0))
             .text_color(move || {
@@ -188,6 +188,7 @@ pub(crate) fn link_line(
 /// A write control. Disabled while `enabled` says no — a busy signature or
 /// an unpaired device starts nothing — and it says so by going quiet.
 pub(crate) fn write_button(
+    id: &'static str,
     label: &'static str,
     enabled: impl Fn() -> bool + Clone + 'static,
     press: impl Fn() + Clone + 'static,
@@ -200,6 +201,7 @@ pub(crate) fn write_button(
     let press_enabled = enabled.clone();
     let color_enabled = enabled;
     view()
+        .test_id(id)
         .rounded(px(10.0))
         .px_3()
         .py_2()
@@ -248,7 +250,8 @@ pub(crate) fn unpaired_banner(nav: Nav) -> impl IntoElement {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(theme::TEAL))
                 .on_press(move || nav.push(Route::Pair(None)))
-                .role(AccessibilityRole::Button),
+                .role(AccessibilityRole::Button)
+                .test_id("pair-now"),
         )
 }
 

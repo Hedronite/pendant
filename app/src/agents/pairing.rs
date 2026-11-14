@@ -127,6 +127,7 @@ fn pair_controls(
         .p_4()
         .child(
             input()
+                .test_id("pair-input")
                 .value(move || draft.get())
                 .placeholder("pendant-pair:v1:…")
                 .auto_capitalize(AutoCapitalize::None)
@@ -140,6 +141,7 @@ fn pair_controls(
                 .flex_row()
                 .gap_3()
                 .child(write_button(
+                    "paste",
                     "Paste from clipboard",
                     enabled,
                     move || {
@@ -153,6 +155,7 @@ fn pair_controls(
                     ButtonKind::Quiet,
                 ))
                 .child(write_button(
+                    "pair-submit",
                     "Pair",
                     move || enabled() && !draft.get().trim().is_empty(),
                     move || {
