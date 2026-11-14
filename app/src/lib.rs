@@ -131,7 +131,11 @@ pub fn App() -> impl IntoElement {
             };
             // The user went back natively (swipe, Android back): drop the
             // page and any above it.
-            page.on_dismiss(move || routes.update(|r| r.truncate(index.get_untracked().max(1))))
+            page.on_dismiss(move || {
+                let at = index.get_untracked().max(1);
+                net::live::trace(&format!("dismissed page {at}"));
+                routes.update(|r| r.truncate(at));
+            })
         },
     ))
 }

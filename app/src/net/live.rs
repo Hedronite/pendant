@@ -98,6 +98,7 @@ thread_local! {
 impl Live {
     /// Start frames for `pane` (the agent's `pane_id`).
     pub fn watch(&self, pane: &str) {
+        trace(&format!("watch pane={pane}"));
         command(Cmd::Watch {
             pane: pane.to_owned(),
             cols: COLS,
@@ -107,6 +108,7 @@ impl Live {
 
     /// Stop frames for `pane` and forget what it received.
     pub fn unwatch(&self, pane: &str) {
+        trace(&format!("unwatch pane={pane}"));
         command(Cmd::Unwatch(pane.to_owned()));
         self.panes.update(|panes| {
             panes.remove(pane);
@@ -243,7 +245,7 @@ pub fn apply(panes: &mut BTreeMap<String, PaneFeed>, down: Down) {
 
 /// One line to the platform log (logcat on Android) and, on iOS, to the
 /// app's stderr, which `simctl launch --console` shows.
-fn trace(line: &str) {
+pub(crate) fn trace(line: &str) {
     log::info!(target: "pendant", "{line}");
     #[cfg(target_os = "ios")]
     eprintln!("pendant: {line}");
