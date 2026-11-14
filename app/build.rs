@@ -1,5 +1,7 @@
-//! Android only: compiles `android/PendantKey.java` to dex, which
-//! `platform/keystore.rs` embeds and loads with `InMemoryDexClassLoader`.
+//! Android only: compiles the app's Java in `android/` (`PendantKey.java`
+//! for the device key, `PendantFolders.java` for the D1 folder probe) to one
+//! dex, which `platform/keystore.rs` embeds and loads with
+//! `InMemoryDexClassLoader`.
 //!
 //! For every other target this does nothing, so a host build (CI on Linux,
 //! with no JDK or Android SDK) is unchanged. On Android it needs a JDK
@@ -22,7 +24,17 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
         return;
     }
-    println!("cargo:rerun-if-changed=android/PendantKey.java");
+    println!("cargo:rerun-if-changed=android");
+    let mut sources: Vec<PathBuf> = fs::read_dir("android")
+        .expect("read android/")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "java"))
+        .collect();
+    sources.sort();
+    assert!(!sources.is_empty(), "no Java under android/");
+    for source in &sources {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
     for var in ["JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT"] {
         println!("cargo:rerun-if-env-changed={var}");
     }
@@ -56,7 +68,7 @@ fn main() {
         .arg(&android_jar)
         .arg("-d")
         .arg(&classes)
-        .arg("android/PendantKey.java"));
+        .args(&sources));
 
     let mut class_files = Vec::new();
     collect_classes(&classes, &mut class_files);
@@ -72,7 +84,7 @@ fn main() {
 
     let classes_dex = dex.join("classes.dex");
     assert!(classes_dex.is_file(), "d8 wrote no classes.dex");
-    println!("cargo:rustc-env=PENDANT_KEY_DEX={}", classes_dex.display());
+    println!("cargo:rustc-env=PENDANT_DEX={}", classes_dex.display());
 }
 
 fn newest_build_tools(sdk: &Path) -> PathBuf {

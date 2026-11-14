@@ -230,7 +230,9 @@ struct Identity {
 
 /// Runs `f` on a thread of its own and resolves with its result, so a
 /// biometric prompt never blocks the engine thread.
-fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> OffThread<T> {
+pub(crate) fn off_thread<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> OffThread<T> {
     let slot = Arc::new(Mutex::new(Slot {
         value: None,
         waker: None,
@@ -260,7 +262,7 @@ struct Slot<T> {
     waker: Option<Waker>,
 }
 
-struct OffThread<T> {
+pub(crate) struct OffThread<T> {
     slot: Arc<Mutex<Slot<T>>>,
     failed: bool,
 }

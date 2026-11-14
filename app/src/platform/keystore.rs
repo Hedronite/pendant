@@ -639,7 +639,7 @@ mod imp {
 
     use super::{KeyError, TAG};
 
-    static DEX: &[u8] = include_bytes!(env!("PENDANT_KEY_DEX"));
+    static DEX: &[u8] = include_bytes!(env!("PENDANT_DEX"));
     const CLASS: &str = "com.hedronite.pendant.PendantKey";
 
     // BiometricPrompt's codes that mean the person stopped, or could not
@@ -699,17 +699,18 @@ mod imp {
         .ok_or(KeyError::Os(-10))
     }
 
-    /// `PendantKey`, loaded once from the embedded dex.
-    fn class(env: &mut JNIEnv) -> Result<&'static GlobalRef, KeyError> {
-        static CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
-        if let Some(class) = CLASS_REF.get() {
-            return Ok(class);
+    /// The class loader over the embedded dex, made once under the app's
+    /// own class loader.
+    fn loader(env: &mut JNIEnv) -> Result<&'static GlobalRef, KeyError> {
+        static LOADER: OnceLock<GlobalRef> = OnceLock::new();
+        if let Some(loader) = LOADER.get() {
+            return Ok(loader);
         }
-        let loaded = load_class(env).map_err(|_| java_failed(env))?;
-        Ok(CLASS_REF.get_or_init(|| loaded))
+        let made = make_loader(env).map_err(|_| java_failed(env))?;
+        Ok(LOADER.get_or_init(|| made))
     }
 
-    fn load_class(env: &mut JNIEnv) -> jni::errors::Result<GlobalRef> {
+    fn make_loader(env: &mut JNIEnv) -> jni::errors::Result<GlobalRef> {
         let app = env
             .call_static_method(
                 "android/app/ActivityThread",
@@ -735,16 +736,38 @@ mod imp {
             "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
             &[JValue::Object(&buffer), JValue::Object(&parent)],
         )?;
-        let name = env.new_string(CLASS)?;
-        let class = env
-            .call_method(
-                &loader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[JValue::Object(&name)],
-            )?
-            .l()?;
-        env.new_global_ref(class)
+        env.new_global_ref(loader)
+    }
+
+    /// A class of the embedded dex by its binary name, loaded once.
+    fn class(env: &mut JNIEnv, name: &'static str) -> Result<GlobalRef, KeyError> {
+        static CLASSES: std::sync::Mutex<Vec<(&'static str, GlobalRef)>> =
+            std::sync::Mutex::new(Vec::new());
+        if let Some((_, class)) = CLASSES
+            .lock()
+            .ok()
+            .and_then(|classes| classes.iter().find(|(n, _)| *n == name).cloned())
+        {
+            return Ok(class);
+        }
+        let loader = loader(env)?;
+        let loaded = (|| {
+            let java_name = env.new_string(name)?;
+            let class = env
+                .call_method(
+                    loader.as_obj(),
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&java_name)],
+                )?
+                .l()?;
+            env.new_global_ref(class)
+        })()
+        .map_err(|_| java_failed(env))?;
+        if let Ok(mut classes) = CLASSES.lock() {
+            classes.push((name, loaded.clone()));
+        }
+        Ok(loaded)
     }
 
     /// Clears a pending Java exception; the call failed.
@@ -755,13 +778,22 @@ mod imp {
         KeyError::Os(-11)
     }
 
-    /// Runs `f` with an attached env and the class.
+    /// Runs `f` with an attached env and `PendantKey`.
     fn with_class<T>(
+        f: impl FnOnce(&mut JNIEnv, &JClass) -> jni::errors::Result<T>,
+    ) -> Result<T, KeyError> {
+        with_java(CLASS, f)
+    }
+
+    /// Runs `f` with an attached env and the embedded dex's class `name`
+    /// (`com.hedronite.pendant.…`). Shared with the folder probe.
+    pub(crate) fn with_java<T>(
+        name: &'static str,
         f: impl FnOnce(&mut JNIEnv, &JClass) -> jni::errors::Result<T>,
     ) -> Result<T, KeyError> {
         let vm = vm()?;
         let mut env = vm.attach_current_thread().map_err(|_| KeyError::Os(-12))?;
-        let global = class(&mut env)?;
+        let global = class(&mut env, name)?;
         let local = env
             .new_local_ref(global.as_obj())
             .map_err(|_| java_failed(&mut env))?;
@@ -901,6 +933,11 @@ mod imp {
         (point[0] == 0x04 && spki.len() == 91).then(|| point.to_vec())
     }
 }
+
+/// The embedded dex's Java, for other Android code in the app (the folder
+/// probe).
+#[cfg(target_os = "android")]
+pub(crate) use imp::with_java;
 
 #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 mod imp {
