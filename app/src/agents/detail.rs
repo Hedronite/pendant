@@ -169,6 +169,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                     .and_then(|snap| snap.agent(&id))
                     .map(|agent| WorktreeRequest {
                         workspace_id: Some(agent.workspace_id.clone()),
+                        branch: Some("pendant-g2-wt-sim".to_owned()),
                         ..Default::default()
                     })
             });
