@@ -4,7 +4,9 @@
 use nsh_base::nav_page;
 use nsh_core::element::{create_root, input};
 use nsh_core::prelude::*;
+use std::cell::RefCell;
 use std::future::Future;
+use std::rc::Rc;
 
 use crate::agents::{page_header, write_button, ButtonKind};
 use crate::net::live::{live, Live};
@@ -12,17 +14,28 @@ use crate::net::pair::{PairState, Payload};
 use crate::theme;
 use crate::Nav;
 
+/// A detached task kept alive: its root owner and its handle, released
+/// by the task itself when it ends.
+type DetachedTask = Option<(Owner, Spawned<()>)>;
+
 /// Runs a pair task in a detached root: the pairing page owns its signals,
 /// not the task, so the page going away does not cancel a pair in flight
 /// (a dismissal used to cancel it 71 ms in, before the POST). The page
 /// reads [`PairState`] for what happened; the task touches nothing the
 /// page owns.
 fn detached_pair(future: impl Future<Output = ()> + 'static) {
-    // The root lives until it is disposed, and nothing ever disposes
-    // this one: the task runs to its end. Its handle, spawned detached,
-    // does not cancel on drop.
-    let (_owner, task) = create_root(move || spawn(future));
-    drop(task);
+    // Dropping the spawned handle cancels the task before its first
+    // poll, so the root owner and the handle live in a slot the task
+    // empties as its last step: the pair is never cancelled this way.
+    let slot: Rc<RefCell<DetachedTask>> = Rc::new(RefCell::new(None));
+    let keep = Rc::clone(&slot);
+    let (owner, task) = create_root(move || {
+        spawn(async move {
+            future.await;
+            keep.borrow_mut().take();
+        })
+    });
+    *slot.borrow_mut() = Some((owner, task));
 }
 
 /// The pairing page. A payload carried by a `pendant://` link pairs at
