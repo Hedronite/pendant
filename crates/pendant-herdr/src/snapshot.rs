@@ -83,7 +83,12 @@ impl Snapshot {
 }
 
 fn unwrap_snapshot_root(raw: &Value) -> &Value {
-    raw.get("result").unwrap_or(raw)
+    let root = raw.get("result").unwrap_or(raw);
+    // herdr 0.9.x answers `session.snapshot` with `{type, snapshot}`; a fixture
+    // or an older reply puts the fields at the root.
+    root.get("snapshot")
+        .filter(|value| value.is_object())
+        .unwrap_or(root)
 }
 
 fn extract_agents(root: &Value) -> Vec<AgentRecord> {
@@ -191,5 +196,29 @@ mod tests {
         let inbox = snap.inbox();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].kind, "blocked");
+    }
+
+    #[test]
+    fn snapshot_reads_the_live_socket_envelope() {
+        let raw = json!({
+            "type": "session_snapshot",
+            "snapshot": {
+                "protocol": 22,
+                "version": "0.9.5",
+                "agents": [{
+                    "agent": "scratch-2",
+                    "pane_id": "w1:p2",
+                    "agent_status": "blocked",
+                    "workspace_id": "w1"
+                }],
+                "workspaces": [{ "workspace_id": "w1", "label": "pendant-scratch" }]
+            }
+        });
+        let snap = Snapshot::from_raw(raw);
+        assert_eq!(snap.agents.len(), 1);
+        assert_eq!(snap.agents[0].pane_id, "w1:p2");
+        assert_eq!(snap.agents[0].status, "blocked");
+        assert_eq!(snap.workspaces[0].label.as_deref(), Some("pendant-scratch"));
+        assert_eq!(snap.inbox().len(), 1);
     }
 }
