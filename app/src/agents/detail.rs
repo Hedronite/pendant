@@ -307,6 +307,7 @@ fn detail_body(
     let id_output = id.clone();
 
     view()
+        .flex_1()
         .flex_col()
         .child(
             // Status and identity.
