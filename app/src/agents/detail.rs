@@ -21,6 +21,16 @@ use crate::net::NetError;
 use crate::theme;
 use crate::Nav;
 
+/// The request a worktree create sends: the agent's workspace and the
+/// branch the field carries.
+pub(crate) fn worktree_request(workspace_id: Option<String>, branch: String) -> WorktreeRequest {
+    WorktreeRequest {
+        workspace_id,
+        branch: Some(branch),
+        ..Default::default()
+    }
+}
+
 /// Which platform this build runs on, for made-up worktree names.
 const WT_PLATFORM: &str = if cfg!(target_os = "android") {
     "android"
@@ -211,6 +221,16 @@ pub fn detail(nav: Nav, id: String) -> Screen {
         eprintln!("pendant: worktree fired");
         let live = live;
         let id = worktree_id.clone();
+        let branch = wt_branch.get_untracked().trim().to_owned();
+        if branch.is_empty() {
+            error_set(
+                &write_error,
+                Some(WriteError::Net(NetError::Transport(
+                    "the branch name is empty".to_owned(),
+                ))),
+            );
+            return;
+        }
         busy.set(true);
         error_set(&write_error, None);
         detached_write(
@@ -219,11 +239,7 @@ pub fn detail(nav: Nav, id: String) -> Screen {
                 let request = live.snapshot.with_untracked(|snap| {
                     snap.as_ref()
                         .and_then(|snap| snap.agent(&id))
-                        .map(|agent| WorktreeRequest {
-                            workspace_id: Some(agent.workspace_id.clone()),
-                            branch: Some("pendant-g2-wt-sim".to_owned()),
-                            ..Default::default()
-                        })
+                        .map(|agent| worktree_request(Some(agent.workspace_id.clone()), branch))
                 });
                 let Some(request) = request else {
                     return Err(WriteError::Net(NetError::Transport(
