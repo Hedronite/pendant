@@ -1,3 +1,15 @@
+<p align="center">
+  <img src="docs/brand/lockup.jpg" alt="Pendant by Hedronite" width="420">
+</p>
+
+<p align="center"><strong>The pendant for your actual computer.</strong></p>
+
+<p align="center">
+  <img alt="Graphite #111513" src="https://img.shields.io/badge/graphite-%23111513-111513">
+  <img alt="Teal #0F5C56" src="https://img.shields.io/badge/teal-%230F5C56-0F5C56">
+  <img alt="Gold #C9A227" src="https://img.shields.io/badge/gold-%23C9A227-C9A227">
+</p>
+
 # Pendant
 
 Pendant is a phone-sized web app for the **herdr** session already running on your computer.
@@ -47,7 +59,7 @@ The phone app lives in `app/`: an [nsh](https://github.com/longbridge/nsh) shell
 
 ```bash
 cd app
-export PENDANT_BRIDGE_URL=https://<your-host>.<tailnet>.ts.net:8443
+export PENDANT_BRIDGE_URL=https://<your-host>.<your-tailnet>.ts.net:8443   # your own Serve origin
 export PENDANT_BUILD_SHA=$(git rev-parse --short HEAD)   # optional: logged as "build <sha>" at start
 nsh package --target ios-simulator
 nsh package --target android --abi arm64-v8a
@@ -81,9 +93,11 @@ adb install -r .nsh/out/Pendant.apk
 
 ## Security
 
-- Tailnet-only. Pendant listens on loopback. Reach it through Tailscale Serve, not the public internet.
-- No WAN bind. Do not put Pendant behind a port-forward or bind it to `0.0.0.0`.
-- Anyone who can open the PWA can prompt agents, send keys, and create worktrees. Treat an unlocked phone on your tailnet as operator access.
+- **Loopback only.** The bridge binds 127.0.0.1/::1 and refuses any other `PENDANT_BIND`. Do not port-forward it or front it with anything public.
+- **Tailnet only, never Funnel.** Tailscale Serve publishes the bridge to every device and user your tailnet ACLs allow, including shared nodes. Restrict port 8443 on the host with ACLs if your tailnet is shared. Never run `tailscale funnel` for Pendant: that puts it on the public internet.
+- **Serve HTTP proxy only.** Use exactly the `tailscale serve --https=8443 http://127.0.0.1:8780` form above. A raw or TLS-terminated TCP forward drops `X-Forwarded-For` and defeats the host-only gate on pairing.
+- **Writes need a paired device.** Prompts, keys, approvals and new worktrees over Serve require a device paired on the host and a fresh biometric-backed signature. Pairing and revoke run on the host only. Treat the pairing link as a one-time secret.
+- **Reads do not.** Any tailnet peer that can reach the Serve origin can read the agent list, agent output and the inbox. Don't run Pendant on a tailnet you share with people who shouldn't see your agents.
 
 ## Workspace
 
