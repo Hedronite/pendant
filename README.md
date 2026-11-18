@@ -1,3 +1,15 @@
+<p align="center">
+  <img src="docs/brand/lockup.jpg" alt="Pendant by Hedronite" width="420">
+</p>
+
+<p align="center"><strong>The pendant for your actual computer.</strong></p>
+
+<p align="center">
+  <img alt="Graphite #111513" src="https://img.shields.io/badge/graphite-%23111513-111513">
+  <img alt="Teal #0F5C56" src="https://img.shields.io/badge/teal-%230F5C56-0F5C56">
+  <img alt="Gold #C9A227" src="https://img.shields.io/badge/gold-%23C9A227-C9A227">
+</p>
+
 # Pendant
 
 Pendant is a phone-sized web app for the **herdr** session already running on your computer.
@@ -47,7 +59,7 @@ The phone app lives in `app/`: an [nsh](https://github.com/longbridge/nsh) shell
 
 ```bash
 cd app
-export PENDANT_BRIDGE_URL=https://<your-host>.<tailnet>.ts.net:8443
+export PENDANT_BRIDGE_URL=https://pendant-host.example.ts.net:8443   # your own Serve origin
 export PENDANT_BUILD_SHA=$(git rev-parse --short HEAD)   # optional: logged as "build <sha>" at start
 nsh package --target ios-simulator
 nsh package --target android --abi arm64-v8a
